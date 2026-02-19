@@ -8,12 +8,12 @@ use rand_distr::Poisson;
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    DemeConfig, DemeRecord, GaussianSelectionTrait, GenerationRecord, IndMuts, MutationRegistry,
-    Parameters, rotate_edges,
+    AssortativeMating, DemeConfig, DemeRecord, GaussianSelectionTrait, GenerationRecord, IndMuts,
+    MutationRegistry, Parameters, rotate_edges,
 };
 
 // ── Inversion definition ─────────────────────────────────────────────────────
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Inversion {
     /// Start position (inclusive).
     pub left: f64,
@@ -63,6 +63,8 @@ pub struct PopulationMetadata {
     pub mean_phenotypes_survivors: Vec<Vec<f64>>,
     /// Per-generation number of segregating mutations
     pub num_segregating_muts: Vec<usize>,
+    /// Random sample of K offspring phenotypes per generation: `[generation][individual][trait]`
+    pub all_phenotypes_offspring: Vec<Vec<Vec<f64>>>,
 }
 
 // ── Simulator ────────────────────────────────────────────────────────────────
@@ -83,6 +85,8 @@ pub struct InvWrightFisher {
     pub inversions: Vec<Inversion>,
     /// `deme_inv_status[deme][individual][inv_idx]`
     pub deme_inv_status: Vec<Vec<Vec<bool>>>,
+
+    pub assortative_mating: Option<AssortativeMating>,
 
     // Cached Poisson distributions (λ = rate × seq_len).
     rec_poisson: Option<Poisson<f64>>,
@@ -165,6 +169,7 @@ impl InvWrightFisher {
             deme_muts,
             inversions,
             deme_inv_status,
+            assortative_mating: None,
             params,
             tables,
             rng,
@@ -176,6 +181,15 @@ impl InvWrightFisher {
     }
 
     // ── Phenotype ────────────────────────────────────────────────────────────
+
+    pub fn parent_phenotype(&self, d: usize, i: usize, t: usize) -> f64 {
+        let baseline = self.traits[t].baseline;
+        let inherited: f64 = self.deme_muts[d][i]
+            .iter()
+            .map(|&(_, idx)| self.registry.effects[idx][t])
+            .sum();
+        baseline + inherited
+    }
 
     pub fn candidate_phenotype(&self, c: &InvOffspringCandidate, t: usize) -> f64 {
         let baseline = self.traits[t].baseline;
@@ -293,6 +307,7 @@ impl InvWrightFisher {
             deme_muts: self.deme_muts.clone(),
             inversions: self.inversions.clone(),
             deme_inv_status: self.deme_inv_status.clone(),
+            assortative_mating: self.assortative_mating.clone(),
             rec_poisson: self.rec_poisson,
             mut_poisson: self.mut_poisson,
         })
@@ -506,10 +521,28 @@ impl InvWrightFisher {
             let pool_size = ((self.params.fecundity * k as f64) as usize).max(k);
             let uniform_parent = Uniform::new(0usize, k)?;
 
+            // Precompute parental phenotypes for assortative mating (if active).
+            let am_data: Option<(Vec<f64>, f64)> =
+                self.assortative_mating.as_ref().map(|am| {
+                    let zs = (0..k)
+                        .map(|i| self.parent_phenotype(d, i, am.trait_index))
+                        .collect();
+                    (zs, am.sigma)
+                });
+
             let candidates: Vec<InvOffspringCandidate> = (0..pool_size)
                 .map(|_| {
                     let pa = uniform_parent.sample(&mut self.rng);
-                    let pb = uniform_parent.sample(&mut self.rng);
+                    let pb = if let Some((ref zs, sigma)) = am_data {
+                        let z_pa = zs[pa];
+                        let weights: Vec<f64> = zs
+                            .iter()
+                            .map(|&z| (-(z_pa - z).powi(2) / (2.0 * sigma * sigma)).exp())
+                            .collect();
+                        WeightedIndex::new(&weights)?.sample(&mut self.rng)
+                    } else {
+                        uniform_parent.sample(&mut self.rng)
+                    };
                     self.sample_candidate(d, pa, pb)
                 })
                 .collect::<Result<_>>()?;
@@ -531,6 +564,23 @@ impl InvWrightFisher {
                         .map(|c| self.candidate_phenotype(c, t))
                         .sum::<f64>()
                         / pool_size as f64
+                })
+                .collect();
+
+            // Sample K offspring phenotypes randomly from the pool
+            let sample_indices: Vec<usize> = if pool_size <= k {
+                (0..pool_size).collect()
+            } else {
+                let mut indices: Vec<usize> = (0..pool_size).collect();
+                indices.shuffle(&mut self.rng);
+                indices.into_iter().take(k).collect()
+            };
+            let all_phenotypes_offspring: Vec<Vec<f64>> = sample_indices
+                .iter()
+                .map(|&i| {
+                    (0..num_traits)
+                        .map(|t| self.candidate_phenotype(&candidates[i], t))
+                        .collect()
                 })
                 .collect();
 
@@ -570,6 +620,7 @@ impl InvWrightFisher {
                 mean_fitness_offspring,
                 mean_phenotypes_survivors,
                 num_segregating_muts,
+                all_phenotypes_offspring,
             });
 
             let survivors: Vec<InvOffspringCandidate> = survivor_indices
@@ -739,6 +790,7 @@ impl InvWrightFisher {
             let mut mean_fitness_offspring: Vec<f64> = Vec::new();
             let mut mean_phenotypes_survivors: Vec<Vec<f64>> = Vec::new();
             let mut num_segregating_muts: Vec<usize> = Vec::new();
+            let mut all_phenotypes_offspring: Vec<Vec<Vec<f64>>> = Vec::new();
 
             for record in records {
                 if d < record.demes.len() {
@@ -748,6 +800,8 @@ impl InvWrightFisher {
                     mean_phenotypes_survivors
                         .push(record.demes[d].mean_phenotypes_survivors.clone());
                     num_segregating_muts.push(record.demes[d].num_segregating_muts);
+                    all_phenotypes_offspring
+                        .push(record.demes[d].all_phenotypes_offspring.clone());
                 }
             }
 
@@ -770,6 +824,7 @@ impl InvWrightFisher {
                 mean_fitness_offspring,
                 mean_phenotypes_survivors,
                 num_segregating_muts,
+                all_phenotypes_offspring,
             };
             let _ = populations.add_row_with_metadata(&meta)?;
         }

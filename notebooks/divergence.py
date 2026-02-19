@@ -68,8 +68,8 @@ def _(fwd_ts, msprime_ts):
 def _():
     import marimo as mo
 
-    infile = mo.cli_args().get("file", "notebooks/trees/neutral.trees")
-    seed = mo.cli_args().get("seed", 12387912)
+    infile = mo.cli_args().get("file", "notebooks/trees/divergent.trees")
+    seed = int(mo.cli_args().get("seed", 42))
     return infile, seed
 
 
@@ -83,7 +83,7 @@ def _(infile, msprime, seed, tskit):
 
 @app.cell
 def _():
-    title = r"$N_1=100, N_2=100, m=0.01$"
+    title = r"$N_1=100, N_2=100, m=0.01, s=0.02$"
     return (title,)
 
 
@@ -106,13 +106,13 @@ def _(fwd_ts, msprime_ts, plt, sample_sets, title, windows):
         fwd_ts.diversity(sample_sets=sample_sets[0], windows=windows, mode="branch")
         / 2,
         windows,
-        label="Fwd",
+        label="Selection",
     )
     plt.stairs(
         msprime_ts.diversity(sample_sets=sample_sets[0], windows=windows, mode="branch")
         / 2,
         windows,
-        label="Msprime",
+        label="Neutral",
     )
     plt.xlabel("Position")
     plt.ylabel("TMRCA")
@@ -129,13 +129,13 @@ def _(fwd_ts, msprime_ts, plt, sample_sets, title, windows):
         fwd_ts.diversity(sample_sets=sample_sets[1], windows=windows, mode="branch")
         / 2,
         windows,
-        label="Fwd",
+        label="Selection",
     )
     plt.stairs(
         msprime_ts.diversity(sample_sets=sample_sets[1], windows=windows, mode="branch")
         / 2,
         windows,
-        label="Msprime",
+        label="Neutral",
     )
     plt.xlabel("Position")
     plt.ylabel("TMRCA")
@@ -151,14 +151,55 @@ def _(fwd_ts, msprime_ts, plt, sample_sets, title, windows):
     plt.stairs(
         fwd_ts.divergence(sample_sets=sample_sets, windows=windows, mode="branch") / 2,
         windows,
+        label="Selection",
     )
     plt.stairs(
         msprime_ts.divergence(sample_sets=sample_sets, windows=windows, mode="branch")
         / 2,
         windows,
+        label="Neutral",
     )
     plt.xlabel("Position")
     plt.ylabel("Cross population TMRCA")
+    plt.legend()
+    plt.title(f"{title}")
+    return
+
+
+@app.cell
+def _(fwd_ts):
+    import json
+
+    metadatas = [json.loads(pop.metadata) for pop in fwd_ts.populations()]
+    return (metadatas,)
+
+
+@app.cell
+def _(metadatas, np, plt, title):
+    plt.plot(
+        np.array(metadatas[0]["mean_phenotypes_offspring"]).flatten(), label="Pop0"
+    )
+    plt.plot(
+        np.array(metadatas[1]["mean_phenotypes_offspring"]).flatten(), label="Pop1"
+    )
+    plt.axhline(3, color="k", ls="--")
+    plt.axhline(-3, color="k", ls="--")
+
+    plt.xlabel("Generation")
+    plt.ylabel("Mean phenotype")
+    plt.legend()
+    plt.title(f"{title}")
+    return
+
+
+@app.cell
+def _(metadatas, np, plt, title):
+    plt.plot(np.array(metadatas[0]["num_segregating_muts"]).flatten(), label="Pop0")
+    plt.plot(np.array(metadatas[1]["num_segregating_muts"]).flatten(), label="Pop1")
+
+    plt.xlabel("Generation")
+    plt.ylabel("\\# segregating mutations")
+    plt.legend()
     plt.title(f"{title}")
     return
 

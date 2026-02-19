@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use forward_rs::inversion::*;
 use forward_rs::*;
+use indicatif::{ProgressBar, ProgressStyle};
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
@@ -9,13 +10,13 @@ use rand::rngs::SmallRng;
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(about = "Two-deme WF simulation with inversions")]
+#[command(about = "Two-deme WF simulation with inversions and assortative mating")]
 struct Args {
-    #[arg(long, default_value_t = 15000)]
+    #[arg(long, default_value_t = 10_000)]
     runtime: usize,
-    #[arg(long, default_value_t = 8000)]
+    #[arg(long, default_value_t = 5_000)]
     burnin: usize,
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 10)]
     intro_window: usize,
     #[arg(long, default_value_t = 100)]
     carrying_capacity: usize,
@@ -25,16 +26,22 @@ struct Args {
     selection_coeff: f64,
     #[arg(long, default_value_t = 1e-9)]
     mutation_rate: f64,
+    #[arg(long, default_value_t = 1e-8)]
+    recombination_rate: f64,
     #[arg(long, default_value_t = 100)]
     simplify_interval: usize,
-    #[arg(long, default_value_t = 4e6)]
+    #[arg(long, default_value_t = 2e6)]
     inv_left: f64,
-    #[arg(long, default_value_t = 6e6)]
+    #[arg(long, default_value_t = 8e6)]
     inv_right: f64,
+    /// Sigma of the Gaussian assortative mating kernel (trait 0).
+    /// Large values → nearly random; small values → highly assortative.
+    #[arg(long, default_value_t = 0.1)]
+    assortative_sigma: f64,
     /// Random seed (random if omitted)
     #[arg(long)]
     seed: Option<u64>,
-    #[arg(long, default_value = "two_deme_inversion.trees")]
+    #[arg(long, default_value = "two_deme_inversion_assortative.trees")]
     output: String,
 }
 
@@ -101,49 +108,70 @@ fn main() -> Result<()> {
         .seed
         .unwrap_or_else(|| rand::rng().random_range(1..u64::MAX));
 
-    eprintln!("=== Two demes with divergent selection + inversions ===");
-    eprintln!("seed={random_seed}");
+    eprintln!("=== Two demes with divergent selection + inversions + assortative mating ===");
 
     let params = Parameters {
         random_seed,
         mutation_rate: args.mutation_rate,
+        recombination_rate: args.recombination_rate,
         simplify_interval: args.simplify_interval,
         runtime: args.runtime,
         ..Parameters::default()
     };
+    eprintln!("Params: {:?}", params);
 
     let deme_configs = vec![
         DemeConfig {
             carrying_capacity: args.carrying_capacity,
             migration_rate: args.migration_rate,
-            trait_optima: vec![-3.0],
+            trait_optima: vec![-3.0, 0.0],
             population_id: tskit::PopulationId::NULL,
         },
         DemeConfig {
             carrying_capacity: args.carrying_capacity,
             migration_rate: args.migration_rate,
-            trait_optima: vec![3.0],
+            trait_optima: vec![3.0, 0.0],
             population_id: tskit::PopulationId::NULL,
         },
     ];
+    eprintln!("{:?}", deme_configs);
 
-    let traits = vec![GaussianSelectionTrait::new(args.selection_coeff)];
+    let traits = vec![
+        GaussianSelectionTrait::new(args.selection_coeff),
+        GaussianSelectionTrait::new(0.0),
+    ];
+    eprintln!("Traits: {:?}", traits);
 
     let inversions = vec![Inversion {
         left: args.inv_left,
         right: args.inv_right,
     }];
+    eprintln!("Inversions: {:?}", inversions);
 
     let mut sim = InvWrightFisher::initialize(params, traits, deme_configs, inversions)?;
+    sim.assortative_mating = Some(AssortativeMating {
+        trait_index: 0,
+        sigma: args.assortative_sigma,
+    });
+    eprintln!("Assortative mating: {:?}", sim.assortative_mating);
+
     let mut tracker = InvTracker::new();
 
     // Phase 1: burn-in (no inversions).
+    let bar = ProgressBar::new(args.runtime as u64);
+    bar.set_style(
+        ProgressStyle::with_template(
+            "[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}",
+        )
+        .expect("Failed to set progress bar style")
+        .progress_chars("##-"),
+    );
+    bar.set_message("Burn-in");
+
     let burnin = args.burnin;
     for g in 0..burnin {
-        if g % 100 == 0 {
-            eprintln!("Burn-in generation {}/{}", g, burnin);
-        }
         sim.step(g, &mut tracker)?;
+        bar.inc(1);
     }
     // Checkpoint (simplifies tables in place once).
     let mut checkpoint = sim.try_clone()?;
@@ -155,83 +183,34 @@ fn main() -> Result<()> {
     let mut attempts = 0u32;
     'condition: loop {
         attempts += 1;
+        bar.set_message(format!("Inversion establishment (attempt {})", attempts));
         for g in burnin..burnin + intro_window {
-            if g % 100 == 0 {
-                eprintln!(
-                    "Establishment window generation {}/{}",
-                    g - burnin,
-                    intro_window
-                );
-            }
             sim.step(g, &mut tracker)?;
+            bar.inc(1);
         }
-        // Introduce inversion at 50% in deme 1.
+        // Introduce inversion in deme 1.
         let inverted_i = sim
             .rng
             .random_range(0..sim.deme_configs[1].carrying_capacity);
         sim.deme_inv_status[1][inverted_i][0] = true;
         for g in burnin + intro_window..runtime {
-            if g % 100 == 0 {
-                eprintln!("Attempt {} — generation {}/{}", attempts, g, runtime);
-            }
             sim.step(g, &mut tracker)?;
+            bar.inc(1);
             if !sim.inversion_segregating(0) {
-                eprintln!("  → fixed or lost at generation {}, retrying", g);
                 tracker.records.truncate(records_after_checkpoint);
                 tracker.inv_freqs.truncate(records_after_checkpoint);
                 sim = checkpoint.try_clone()?;
                 let rng = SmallRng::seed_from_u64(sim.params.random_seed + attempts as u64);
                 sim.rng = rng;
+                // Reset progress bar
+                bar.set_position(burnin as u64);
+                bar.reset_eta();
                 continue 'condition;
             }
         }
-        eprintln!(
-            "Inversion survived to runtime after {} attempt(s)",
-            attempts
-        );
         break;
     }
-
-    // ── Summary ──────────────────────────────────────────────────────────────
-    let num_records = tracker.records.len();
-    eprintln!("Tracker records: {}", num_records);
-
-    // Print inversion frequency trajectory (every 100 generations).
-    eprintln!("\nInversion frequency trajectory:");
-    eprintln!("{:>6}  {:>10}  {:>10}", "gen", "deme0", "deme1");
-    for (g, gen_freqs) in tracker.inv_freqs.iter().enumerate() {
-        if g % 100 == 0 || g == num_records - 1 {
-            eprintln!(
-                "{:>6}  {:>10.4}  {:>10.4}",
-                g, gen_freqs[0][0], gen_freqs[1][0]
-            );
-        }
-    }
-
-    // Print phenotype summary.
-    if let Some(first) = tracker.records.first() {
-        for (d, dr) in first.demes.iter().enumerate() {
-            eprintln!(
-                "Gen 0 deme {} — mean pheno: {:.4}",
-                d,
-                dr.mean_phenotypes_offspring.first().copied().unwrap_or(0.0),
-            );
-        }
-    }
-    if let Some(last) = tracker.records.last() {
-        for (d, dr) in last.demes.iter().enumerate() {
-            eprintln!(
-                "Gen {} deme {} — mean pheno: {:.4}",
-                num_records - 1,
-                d,
-                dr.mean_phenotypes_offspring.first().copied().unwrap_or(0.0),
-            );
-        }
-    }
-
     let ts = sim.finalize_with_metadata(&tracker.records, &tracker.inv_freqs)?;
-    eprintln!("num_trees: {}", ts.num_trees());
-    eprintln!("num_populations: {}", ts.populations().num_rows());
     ts.dump(&args.output, tskit::TableOutputOptions::default())?;
     Ok(())
 }

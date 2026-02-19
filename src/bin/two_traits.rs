@@ -1,12 +1,16 @@
 use anyhow::Result;
 use clap::Parser;
 use forward_rs::*;
+use rand::Rng;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
 #[command(about = "Single-deme Wright-Fisher simulation with two traits")]
 struct Args {
+    /// Random seed (random if omitted)
+    #[arg(long)]
+    seed: Option<u64>,
     #[arg(long, default_value_t = 15000)]
     runtime: usize,
     #[arg(long, default_value_t = 500)]
@@ -28,9 +32,14 @@ fn main() -> Result<()> {
 
     eprintln!("=== Single deme with two independent traits under stabilizing selection ===");
 
+    let random_seed = args
+        .seed
+        .unwrap_or_else(|| rand::rng().random_range(1..u64::MAX));
+
     let params = Parameters {
         mutation_rate: args.mutation_rate,
         runtime: args.runtime,
+        random_seed,
         ..Parameters::default()
     };
 

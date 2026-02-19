@@ -40,6 +40,20 @@ impl MutationEffectDist {
     }
 }
 
+// ── Assortative mating ────────────────────────────────────────────────────────
+
+/// Gaussian assortative mating: mate 2 is drawn proportional to
+/// exp(-(z1 - z2)^2 / (2 σ^2)) where z is the phenotype for `trait_index`.
+/// Only affects within-deme mate choice during offspring pool generation.
+#[derive(Clone, Debug)]
+pub struct AssortativeMating {
+    /// Index into `WrightFisher::traits` used for mate choice.
+    pub trait_index: usize,
+    /// Standard deviation of the Gaussian mating kernel.
+    /// Large σ → nearly random; small σ → highly assortative.
+    pub sigma: f64,
+}
+
 // ── Parameters ────────────────────────────────────────────────────────────────
 #[derive(Clone, Debug)]
 pub struct Parameters {
@@ -119,7 +133,7 @@ impl MutationRegistry {
 
 /// A single quantitative trait under Gaussian stabilizing selection.
 ///
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct GaussianSelectionTrait {
     /// Accumulated effect of all fixed mutations.
     pub baseline: f64,
@@ -156,6 +170,8 @@ pub struct PopulationMetadata {
     pub mean_phenotypes_survivors: Vec<Vec<f64>>,
     /// Per-generation number of segregating mutations
     pub num_segregating_muts: Vec<usize>,
+    /// Random sample of K offspring phenotypes per generation: `[generation][individual][trait]`
+    pub all_phenotypes_offspring: Vec<Vec<Vec<f64>>>,
 }
 
 // ── Tracker trait ─────────────────────────────────────────────────────────────
@@ -169,6 +185,8 @@ pub struct DemeRecord {
     pub mean_phenotypes_survivors: Vec<f64>,
     /// Number of segregating mutations in this deme.
     pub num_segregating_muts: usize,
+    /// Random sample of K offspring phenotypes: `phenotypes[individual][trait]`.
+    pub all_phenotypes_offspring: Vec<Vec<f64>>,
 }
 
 pub struct GenerationRecord {
@@ -275,6 +293,9 @@ pub struct WrightFisher {
     /// `deme_muts[d][i]` = segregating mutations of individual i in deme d.
     pub deme_muts: Vec<Vec<IndMuts>>,
 
+    /// Optional assortative mating rule applied during offspring pool generation.
+    pub assortative_mating: Option<AssortativeMating>,
+
     // Cached Poisson distributions (λ = rate × seq_len).
     rec_poisson: Option<Poisson<f64>>,
     mut_poisson: Option<Poisson<f64>>,
@@ -315,15 +336,18 @@ impl WrightFisher {
         let birth_time = params.runtime as i64 - 1;
 
         let rec_poisson = if params.recombination_rate * params.sequence_length > 0.0 {
-            Some(Poisson::new(params.recombination_rate * params.sequence_length)?)
+            Some(Poisson::new(
+                params.recombination_rate * params.sequence_length,
+            )?)
         } else {
             None
         };
-        let mut_poisson = if !traits.is_empty() && params.mutation_rate * params.sequence_length > 0.0 {
-            Some(Poisson::new(params.mutation_rate * params.sequence_length)?)
-        } else {
-            None
-        };
+        let mut_poisson =
+            if !traits.is_empty() && params.mutation_rate * params.sequence_length > 0.0 {
+                Some(Poisson::new(params.mutation_rate * params.sequence_length)?)
+            } else {
+                None
+            };
 
         Ok(Self {
             registry: MutationRegistry::new(num_traits),
@@ -336,6 +360,7 @@ impl WrightFisher {
             rng,
             birth_time,
             bookmark: tskit::types::Bookmark::default(),
+            assortative_mating: None,
             rec_poisson,
             mut_poisson,
         })
@@ -352,6 +377,16 @@ impl WrightFisher {
             .sum();
         let new_muts: f64 = c.new_mut_data.iter().map(|(_, eff)| eff[t]).sum();
         baseline + inherited + new_muts
+    }
+
+    /// Phenotype of the current (parental) individual `i` in deme `d` for trait `t`.
+    pub fn parent_phenotype(&self, d: usize, i: usize, t: usize) -> f64 {
+        let baseline = self.traits[t].baseline;
+        let inherited: f64 = self.deme_muts[d][i]
+            .iter()
+            .map(|&(_, idx)| self.registry.effects[idx][t])
+            .sum();
+        baseline + inherited
     }
 
     // ── Fitness ───────────────────────────────────────────────────────────────
@@ -430,9 +465,8 @@ impl WrightFisher {
         };
         let breakpoints = if num_bp > 0 && seq_len >= 2.0 {
             let bp_dist = Uniform::new(1u64, seq_len as u64)?;
-            let mut bps_u64: Vec<u64> = (0..num_bp)
-                .map(|_| bp_dist.sample(&mut self.rng))
-                .collect();
+            let mut bps_u64: Vec<u64> =
+                (0..num_bp).map(|_| bp_dist.sample(&mut self.rng)).collect();
             bps_u64.sort_unstable();
             bps_u64.dedup();
             bps_u64.iter().map(|&x| x as f64).collect()
@@ -535,11 +569,31 @@ impl WrightFisher {
             let pool_size = ((self.params.fecundity * k as f64) as usize).max(k);
             let uniform_parent = Uniform::new(0usize, k)?;
 
+            // Precompute parental phenotypes for assortative mating (if active).
+            // Store (phenotypes_vec, sigma) so the closure below owns all it needs
+            // without re-borrowing `self`.
+            let am_data: Option<(Vec<f64>, f64)> =
+                self.assortative_mating.as_ref().map(|am| {
+                    let zs = (0..k)
+                        .map(|i| self.parent_phenotype(d, i, am.trait_index))
+                        .collect();
+                    (zs, am.sigma)
+                });
+
             // Produce offspring pool.
             let candidates: Vec<OffspringCandidate> = (0..pool_size)
                 .map(|_| {
                     let pa = uniform_parent.sample(&mut self.rng);
-                    let pb = uniform_parent.sample(&mut self.rng);
+                    let pb = if let Some((ref zs, sigma)) = am_data {
+                        let z_pa = zs[pa];
+                        let weights: Vec<f64> = zs
+                            .iter()
+                            .map(|&z| (-(z_pa - z).powi(2) / (2.0 * sigma * sigma)).exp())
+                            .collect();
+                        WeightedIndex::new(&weights)?.sample(&mut self.rng)
+                    } else {
+                        uniform_parent.sample(&mut self.rng)
+                    };
                     self.sample_candidate(d, pa, pb)
                 })
                 .collect::<Result<_>>()?;
@@ -563,6 +617,23 @@ impl WrightFisher {
                         .map(|c| self.candidate_phenotype(c, t))
                         .sum::<f64>()
                         / pool_size as f64
+                })
+                .collect();
+
+            // Sample K offspring phenotypes randomly from the pool
+            let sample_indices: Vec<usize> = if pool_size <= k {
+                (0..pool_size).collect()
+            } else {
+                let mut indices: Vec<usize> = (0..pool_size).collect();
+                indices.shuffle(&mut self.rng);
+                indices.into_iter().take(k).collect()
+            };
+            let all_phenotypes_offspring: Vec<Vec<f64>> = sample_indices
+                .iter()
+                .map(|&i| {
+                    (0..num_traits)
+                        .map(|t| self.candidate_phenotype(&candidates[i], t))
+                        .collect()
                 })
                 .collect();
 
@@ -603,6 +674,7 @@ impl WrightFisher {
                 mean_fitness_offspring,
                 mean_phenotypes_survivors,
                 num_segregating_muts,
+                all_phenotypes_offspring,
             });
 
             let survivors: Vec<OffspringCandidate> = survivor_indices
@@ -768,6 +840,7 @@ impl WrightFisher {
             let mut mean_fitness_offspring: Vec<f64> = Vec::new();
             let mut mean_phenotypes_survivors: Vec<Vec<f64>> = Vec::new();
             let mut num_segregating_muts: Vec<usize> = Vec::new();
+            let mut all_phenotypes_offspring: Vec<Vec<Vec<f64>>> = Vec::new();
 
             for record in records {
                 if d < record.demes.len() {
@@ -777,6 +850,8 @@ impl WrightFisher {
                     mean_phenotypes_survivors
                         .push(record.demes[d].mean_phenotypes_survivors.clone());
                     num_segregating_muts.push(record.demes[d].num_segregating_muts);
+                    all_phenotypes_offspring
+                        .push(record.demes[d].all_phenotypes_offspring.clone());
                 }
             }
 
@@ -786,6 +861,7 @@ impl WrightFisher {
                 mean_fitness_offspring,
                 mean_phenotypes_survivors,
                 num_segregating_muts,
+                all_phenotypes_offspring,
             };
             let _ = populations.add_row_with_metadata(&meta)?;
         }

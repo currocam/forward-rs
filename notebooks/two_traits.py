@@ -31,24 +31,23 @@ def _():
 @app.cell
 def _():
     import matplotlib.pyplot as plt
-    import scienceplots
-    import seaborn as sns
+    import scienceplots  # noqa: F401
 
     plt.style.use("science")
     return (plt,)
 
 
 @app.cell
-def _(fwd_ts, msprime):
+def _(fwd_ts, msprime, seed):
     msprime_ts = msprime.sim_ancestry(
         samples=500,
         population_size=500,
         sequence_length=fwd_ts.sequence_length,
         recombination_rate=1e-6,
-        random_seed=42,
+        random_seed=seed,
         ploidy=1,
     )
-    msprime_ts = msprime.sim_mutations(msprime_ts, rate=1e-8, random_seed=42)
+    msprime_ts = msprime.sim_mutations(msprime_ts, rate=1e-8, random_seed=seed)
     return (msprime_ts,)
 
 
@@ -65,9 +64,18 @@ def _(fwd_ts, msprime_ts):
 
 
 @app.cell
-def _(msprime, tskit):
-    fwd_ts = tskit.load("notebooks/trees/one_deme.trees")
-    fwd_ts = msprime.sim_mutations(fwd_ts, rate=1e-8, random_seed=42)
+def _():
+    import marimo as mo
+
+    infile = mo.cli_args().get("file", "notebooks/trees/one_deme.trees")
+    seed = int(mo.cli_args().get("seed", 42))
+    return infile, seed
+
+
+@app.cell
+def _(infile, msprime, seed, tskit):
+    fwd_ts = tskit.load(infile)
+    fwd_ts = msprime.sim_mutations(fwd_ts, rate=1e-8, random_seed=seed)
     fwd_ts
     return (fwd_ts,)
 
