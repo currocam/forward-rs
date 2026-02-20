@@ -63,8 +63,10 @@ pub struct PopulationMetadata {
     pub mean_phenotypes_survivors: Vec<Vec<f64>>,
     /// Per-generation number of segregating mutations
     pub num_segregating_muts: Vec<usize>,
-    /// Random sample of K offspring phenotypes per generation: `[generation][individual][trait]`
-    pub all_phenotypes_offspring: Vec<Vec<Vec<f64>>>,
+    /// Per-generation flat row-major covariance of offspring pool: `[generation][T²]`
+    pub cov_phenotypes_offspring: Vec<Vec<f64>>,
+    /// Per-generation flat row-major covariance of survivors: `[generation][T²]`
+    pub cov_phenotypes_survivors: Vec<Vec<f64>>,
 }
 
 // ── Simulator ────────────────────────────────────────────────────────────────
@@ -567,22 +569,15 @@ impl InvWrightFisher {
                 })
                 .collect();
 
-            // Sample K offspring phenotypes randomly from the pool
-            let sample_indices: Vec<usize> = if pool_size <= k {
-                (0..pool_size).collect()
-            } else {
-                let mut indices: Vec<usize> = (0..pool_size).collect();
-                indices.shuffle(&mut self.rng);
-                indices.into_iter().take(k).collect()
-            };
-            let all_phenotypes_offspring: Vec<Vec<f64>> = sample_indices
-                .iter()
-                .map(|&i| {
+            // Collect full-pool phenotype vectors for offspring MVN
+            let offspring_phenos: Vec<Vec<f64>> = (0..pool_size)
+                .map(|i| {
                     (0..num_traits)
                         .map(|t| self.candidate_phenotype(&candidates[i], t))
                         .collect()
                 })
                 .collect();
+            let (_, cov_phenotypes_offspring) = crate::mle_mvn(&offspring_phenos);
 
             let survivor_indices: Vec<usize> = if num_traits == 0 {
                 let ud = Uniform::new(0usize, pool_size)?;
@@ -602,6 +597,17 @@ impl InvWrightFisher {
                 })
                 .collect();
 
+            // Survivor phenotypes (all K survivors)
+            let survivor_phenos: Vec<Vec<f64>> = survivor_indices
+                .iter()
+                .map(|&i| {
+                    (0..num_traits)
+                        .map(|t| self.candidate_phenotype(&candidates[i], t))
+                        .collect()
+                })
+                .collect();
+            let (_, cov_phenotypes_survivors) = crate::mle_mvn(&survivor_phenos);
+
             // Count segregating mutations in this deme
             let mut counts: HashMap<usize, usize> = HashMap::new();
             for ind in &self.deme_muts[d] {
@@ -620,7 +626,8 @@ impl InvWrightFisher {
                 mean_fitness_offspring,
                 mean_phenotypes_survivors,
                 num_segregating_muts,
-                all_phenotypes_offspring,
+                cov_phenotypes_offspring,
+                cov_phenotypes_survivors,
             });
 
             let survivors: Vec<InvOffspringCandidate> = survivor_indices
@@ -790,7 +797,8 @@ impl InvWrightFisher {
             let mut mean_fitness_offspring: Vec<f64> = Vec::new();
             let mut mean_phenotypes_survivors: Vec<Vec<f64>> = Vec::new();
             let mut num_segregating_muts: Vec<usize> = Vec::new();
-            let mut all_phenotypes_offspring: Vec<Vec<Vec<f64>>> = Vec::new();
+            let mut cov_phenotypes_offspring: Vec<Vec<f64>> = Vec::new();
+            let mut cov_phenotypes_survivors: Vec<Vec<f64>> = Vec::new();
 
             for record in records {
                 if d < record.demes.len() {
@@ -800,8 +808,10 @@ impl InvWrightFisher {
                     mean_phenotypes_survivors
                         .push(record.demes[d].mean_phenotypes_survivors.clone());
                     num_segregating_muts.push(record.demes[d].num_segregating_muts);
-                    all_phenotypes_offspring
-                        .push(record.demes[d].all_phenotypes_offspring.clone());
+                    cov_phenotypes_offspring
+                        .push(record.demes[d].cov_phenotypes_offspring.clone());
+                    cov_phenotypes_survivors
+                        .push(record.demes[d].cov_phenotypes_survivors.clone());
                 }
             }
 
@@ -824,7 +834,8 @@ impl InvWrightFisher {
                 mean_fitness_offspring,
                 mean_phenotypes_survivors,
                 num_segregating_muts,
-                all_phenotypes_offspring,
+                cov_phenotypes_offspring,
+                cov_phenotypes_survivors,
             };
             let _ = populations.add_row_with_metadata(&meta)?;
         }

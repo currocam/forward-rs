@@ -12,9 +12,9 @@ use rand::rngs::SmallRng;
 #[derive(Parser)]
 #[command(about = "Two-deme WF simulation with inversions and assortative mating")]
 struct Args {
-    #[arg(long, default_value_t = 10_000)]
+    #[arg(long, default_value_t = 40_000)]
     runtime: usize,
-    #[arg(long, default_value_t = 5_000)]
+    #[arg(long, default_value_t = 20_000)]
     burnin: usize,
     #[arg(long, default_value_t = 10)]
     intro_window: usize,

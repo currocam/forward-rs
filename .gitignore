@@ -1,3 +1,5 @@
+*.trees
+nextflow
 .nextflow*
 work/*
 .claude
