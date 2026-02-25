@@ -12,9 +12,9 @@ struct Args {
     seed: Option<u64>,
     #[arg(long, default_value_t = 15000)]
     runtime: usize,
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 1000)]
     carrying_capacity_deme0: usize,
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 1000)]
     carrying_capacity_deme1: usize,
     #[arg(long, default_value_t = 0.01)]
     migration_rate: f64,
@@ -36,29 +36,31 @@ fn main() -> Result<()> {
     let params = Parameters {
         mutation_rate: 0.0,
         runtime: args.runtime,
-        random_seed: random_seed,
-        ..Parameters::default()
+        random_seed,
+        recombination_rate: 1e-8,
+        sequence_length: 1e8,
+        simplify_interval: 100,
     };
     eprintln!("{:?}", params);
+
+    // Empty architecture (no loci, neutral model)
+    let architecture = GeneticArchitecture::new(vec![], 2)?;
 
     let deme_configs = vec![
         DemeConfig {
             carrying_capacity: args.carrying_capacity_deme0,
             migration_rate: args.migration_rate,
-            trait_optima: vec![0.0],
             population_id: tskit::PopulationId::NULL,
         },
         DemeConfig {
             carrying_capacity: args.carrying_capacity_deme1,
             migration_rate: args.migration_rate,
-            trait_optima: vec![0.0],
             population_id: tskit::PopulationId::NULL,
         },
     ];
     eprintln!("{:?}", deme_configs);
 
-    let traits = vec![];
-    let mut sim = WrightFisher::initialize(params, traits, deme_configs)?;
+    let mut sim = WrightFisher::initialize(params, architecture, deme_configs)?;
     let mut tracker = SimpleTracker::new();
     sim.run(&mut tracker)?;
     let ts = sim.finalize_with_metadata(&tracker.records)?;

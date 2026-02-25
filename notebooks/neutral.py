@@ -13,7 +13,7 @@
 
 import marimo
 
-__generated_with = "0.19.11"
+__generated_with = "0.20.2"
 app = marimo.App(width="medium")
 
 
@@ -38,13 +38,13 @@ def _():
 @app.cell
 def _(fwd_ts, msprime, seed):
     demography = msprime.Demography.island_model(
-        initial_size=[100, 100], migration_rate=0.01
+        initial_size=[1000, 1000], migration_rate=0.01
     )
     msprime_ts = msprime.sim_ancestry(
-        samples={"pop_0": 100, "pop_1": 100},
+        samples={"pop_0": 10, "pop_1": 10},
         demography=demography,
         sequence_length=fwd_ts.sequence_length,
-        recombination_rate=1e-6,
+        recombination_rate=1e-8,
         random_seed=seed,
         ploidy=1,
     )
@@ -68,22 +68,31 @@ def _(fwd_ts, msprime_ts):
 def _():
     import marimo as mo
 
-    infile = mo.cli_args().get("file", "notebooks/trees/neutral.trees")
+    infile = mo.cli_args().get("file", "neutral.trees")
     seed = mo.cli_args().get("seed", 12387912)
     return infile, seed
 
 
 @app.cell
-def _(infile, msprime, seed, tskit):
+def _():
+    return
+
+
+@app.cell
+def _(infile, msprime, np, seed, tskit):
     fwd_ts = tskit.load(infile)
     fwd_ts = msprime.sim_mutations(fwd_ts, rate=1e-8, random_seed=seed)
-    fwd_ts
+    selected = np.concatenate([
+        np.random.choice(fwd_ts.samples(population_id=0), 10, replace=False),
+        np.random.choice(fwd_ts.samples(population_id=1), 10, replace=False),
+    ])
+    fwd_ts = fwd_ts.simplify(samples=selected)
     return (fwd_ts,)
 
 
 @app.cell
 def _():
-    title = r"$N_1=100, N_2=100, m=0.01$"
+    title = r"$N_1=1000, N_2=1000, m=0.01$"
     return (title,)
 
 

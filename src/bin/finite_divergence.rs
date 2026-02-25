@@ -3,12 +3,9 @@ use clap::Parser;
 use forward_rs::*;
 use rand::Rng;
 
-// ── CLI ───────────────────────────────────────────────────────────────────────
-
 #[derive(Parser)]
 #[command(about = "Two-deme finite sites model with divergent selection")]
 struct Args {
-    /// Random seed (random if omitted)
     #[arg(long)]
     seed: Option<u64>,
     #[arg(long, default_value_t = 10000)]
@@ -19,24 +16,27 @@ struct Args {
     migration_rate: f64,
     #[arg(long, default_value_t = 1e-5)]
     mutation_rate: f64,
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 20)]
     num_loci: usize,
     #[arg(long, default_value_t = 0.05)]
     selection_coeff: f64,
-    #[arg(long, default_value = "two_deme_divergent.trees")]
+    #[arg(long, default_value = "finite_divergence.trees")]
     output: String,
 }
 
-// ── Main ─────────────────────────────────────────────────────────────────────
-
 fn main() -> Result<()> {
     let args = Args::parse();
-
-    eprintln!("=== Two demes with divergent selection ({} loci) ===", args.num_loci);
-
     let random_seed = args
         .seed
         .unwrap_or_else(|| rand::rng().random_range(1..u64::MAX));
+
+    eprintln!(
+        "=== Finite sites: Two demes with {} loci under divergent selection ===",
+        args.num_loci
+    );
+    eprintln!("  Selection coefficient: ±{}", args.selection_coeff);
+    eprintln!("  Migration rate: {}", args.migration_rate);
+    eprintln!("  Mutation rate (per locus): {}", args.mutation_rate);
 
     // Create loci with divergent selection
     let seq_len = 1e7;
@@ -62,7 +62,7 @@ fn main() -> Result<()> {
         recombination_rate: 1e-8,
         mutation_rate: args.mutation_rate,
         sequence_length: seq_len,
-        simplify_interval: 100,
+        simplify_interval: args.runtime / 100,
     };
 
     let deme_configs = vec![
@@ -80,8 +80,17 @@ fn main() -> Result<()> {
 
     let mut sim = WrightFisher::initialize(params, architecture, deme_configs)?;
     let mut tracker = SimpleTracker::new();
+
+    eprintln!("Running simulation for {} generations...", args.runtime);
     sim.run(&mut tracker)?;
+
+    eprintln!("Finalizing tree sequence...");
     let ts = sim.finalize_with_metadata(&tracker.records)?;
+
+    eprintln!("Simulation complete. Writing to {}", args.output);
+    eprintln!("  Total trees: {}", ts.num_trees());
+    eprintln!("  Total nodes: {}", ts.nodes().num_rows());
+
     ts.dump(&args.output, tskit::TableOutputOptions::default())?;
     Ok(())
 }

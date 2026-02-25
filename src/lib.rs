@@ -1,57 +1,89 @@
-pub mod inversion;
-
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use indicatif::ProgressBar;
 use rand::SeedableRng;
 use rand::distr::weighted::WeightedIndex;
-use rand::distr::{Distribution, Uniform};
 use rand::prelude::*;
 use rand::rngs::SmallRng;
-use rand::seq::SliceRandom;
 use rand_distr::Poisson;
-use std::collections::{HashMap, HashSet};
+use std::slice::ChunksExactMut;
+// ── Genetic Architecture ─────────────────────────────────────────────────────
 
-// ── Distribution of effect sizes ─────────────────────────────────────────────
-#[derive(Clone, Debug)]
-pub enum MutationEffectDist {
-    /// Default. Each new mutation picks one trait at random and draws
-    /// an effect from Uniform(-scale, scale); all other traits get 0.
-    UniformSingle { scale: f64 },
-    /// Original behavior. Each trait gets an independently drawn effect
-    /// from Uniform(-scale, scale).
-    UniformAll { scale: f64 },
+/// A bi-allelic locus with position and per-deme selection coefficients
+#[derive(Debug, Clone)]
+pub struct Locus {
+    pub position: f64,
+    /// Selection coefficient per deme when in derived state (1)
+    /// Positive = beneficial, negative = deleterious
+    pub selection_coeffs: Vec<f64>,
 }
 
-impl MutationEffectDist {
-    pub fn sample(&self, rng: &mut SmallRng, num_traits: usize) -> Vec<f64> {
-        match self {
-            Self::UniformSingle { scale } => {
-                let t = rng.random_range(0..num_traits);
-                let eff = Uniform::new(-scale, *scale).unwrap().sample(rng);
-                let mut v = vec![0.0; num_traits];
-                v[t] = eff;
-                v
-            }
-            Self::UniformAll { scale } => {
-                let dist = Uniform::new(-scale, *scale).unwrap();
-                (0..num_traits).map(|_| dist.sample(rng)).collect()
+/// Pre-defined genetic architecture for finite sites model
+#[derive(Debug, Clone)]
+pub struct GeneticArchitecture {
+    pub loci: Vec<Locus>,
+    pub num_demes: usize,
+    // Cached SoA layout (built once in new())
+    positions: Vec<f64>,  // length = num_loci, contiguous
+    sel_coeffs: Vec<f64>, // length = num_loci * num_demes, flat [l * num_demes + d]
+}
+
+impl GeneticArchitecture {
+    pub fn new(loci: Vec<Locus>, num_demes: usize) -> Result<Self> {
+        // Validate all loci have correct number of selection coefficients
+        for (i, locus) in loci.iter().enumerate() {
+            if locus.selection_coeffs.len() != num_demes {
+                return Err(anyhow!(
+                    "Locus {} has {} selection coeffs, expected {}",
+                    i,
+                    locus.selection_coeffs.len(),
+                    num_demes
+                ));
             }
         }
+
+        // Validate positions are sorted and unique
+        for w in loci.windows(2) {
+            if w[0].position >= w[1].position {
+                return Err(anyhow!("Locus positions not strictly increasing"));
+            }
+        }
+
+        // Build cached flat arrays
+        let positions: Vec<f64> = loci.iter().map(|l| l.position).collect();
+        let mut sel_coeffs = Vec::with_capacity(loci.len() * num_demes);
+        for locus in &loci {
+            sel_coeffs.extend_from_slice(&locus.selection_coeffs);
+        }
+
+        Ok(Self {
+            loci,
+            num_demes,
+            positions,
+            sel_coeffs,
+        })
     }
-}
 
-// ── Assortative mating ────────────────────────────────────────────────────────
+    pub fn num_loci(&self) -> usize {
+        self.loci.len()
+    }
 
-/// Gaussian assortative mating: mate 2 is drawn proportional to
-/// exp(-(z1 - z2)^2 / (2 σ^2)) where z is the phenotype for `trait_index`.
-/// Only affects within-deme mate choice during offspring pool generation.
-#[derive(Clone, Debug)]
-pub struct AssortativeMating {
-    /// Index into `WrightFisher::traits` used for mate choice.
-    pub trait_index: usize,
-    /// Standard deviation of the Gaussian mating kernel.
-    /// Large σ → nearly random; small σ → highly assortative.
-    pub sigma: f64,
+    #[inline]
+    pub fn position(&self, l: usize) -> f64 {
+        self.positions[l]
+    }
+
+    #[inline]
+    pub fn positions(&self) -> &[f64] {
+        &self.positions
+    }
+
+    #[inline]
+    pub fn selection_coeff(&self, l: usize, d: usize) -> f64 {
+        debug_assert!(l * self.num_demes + d < self.sel_coeffs.len());
+        // SAFETY: l < num_loci and d < num_demes, both enforced by callers
+        // and validated in new(). sel_coeffs has length num_loci * num_demes.
+        unsafe { *self.sel_coeffs.get_unchecked(l * self.num_demes + d) }
+    }
 }
 
 // ── Parameters ────────────────────────────────────────────────────────────────
@@ -61,12 +93,9 @@ pub struct Parameters {
     pub sequence_length: f64,
     pub runtime: usize,
     pub recombination_rate: f64,
-    pub mutation_rate: f64,
+    pub mutation_rate: f64, // per-locus per-generation
     /// Simplify every this many generations (0 = only at finalize).
     pub simplify_interval: usize,
-    /// Offspring pool = fecundity × K_d before density regulation.
-    pub fecundity: f64,
-    pub effect_dist: MutationEffectDist,
 }
 
 impl Default for Parameters {
@@ -77,11 +106,9 @@ impl Default for Parameters {
             random_seed,
             sequence_length: 1e7,
             runtime: 5_000,
-            recombination_rate: 1e-6,
-            mutation_rate: 0.0,
+            recombination_rate: 1e-8,
+            mutation_rate: 1e-6,
             simplify_interval: 100,
-            fecundity: 10.0,
-            effect_dist: MutationEffectDist::UniformSingle { scale: 1.0 },
         }
     }
 }
@@ -92,65 +119,101 @@ pub struct DemeConfig {
     pub carrying_capacity: usize,
     /// Fraction of K_d that emigrate each generation.
     pub migration_rate: f64,
-    /// Length == num_traits.  Deme-specific phenotypic targets.
-    pub trait_optima: Vec<f64>,
     /// Set during `initialize`; used by `commit_to_tables`.
     pub population_id: tskit::PopulationId,
 }
 
-// ── Polygenic components ──────────────────────────────────────────────────────
+// ── Double-Buffered Structures ────────────────────────────────────────────────
 
-/// Per-individual mutation set kept **sorted by genomic position**.
-/// Each entry is `(position, global_mutation_index)`.
-pub type IndMuts = Vec<(f64, usize)>;
-
-/// Global registry of every mutation ever created.
-#[derive(Clone, Debug)]
-pub struct MutationRegistry {
-    pub positions: Vec<f64>,
-    /// `effects[mutation_idx][trait_idx]`
-    pub effects: Vec<Vec<f64>>,
-    pub num_traits: usize,
+/// Double-buffered genotype storage for one deme (flat layout for cache locality)
+struct GenotypeBuffer {
+    current: Vec<u8>, // K * num_loci contiguous
+    next: Vec<u8>,    // K * num_loci contiguous
+    num_loci: usize,
 }
 
-impl MutationRegistry {
-    pub fn new(num_traits: usize) -> Self {
+impl GenotypeBuffer {
+    fn new(capacity: usize, num_loci: usize) -> Self {
         Self {
-            positions: Vec::new(),
-            effects: Vec::new(),
-            num_traits,
+            current: vec![0u8; capacity * num_loci],
+            next: vec![0u8; capacity * num_loci],
+            num_loci,
         }
     }
 
-    pub fn push(&mut self, pos: f64, effects: Vec<f64>) -> usize {
-        debug_assert_eq!(effects.len(), self.num_traits);
-        let idx = self.positions.len();
-        self.positions.push(pos);
-        self.effects.push(effects);
-        idx
+    fn current_genotype(&self, i: usize) -> &[u8] {
+        let start = i * self.num_loci;
+        &self.current[start..start + self.num_loci]
+    }
+
+    #[cfg(test)]
+    fn next_genotype(&self, i: usize) -> &[u8] {
+        let start = i * self.num_loci;
+        &self.next[start..start + self.num_loci]
+    }
+
+    #[cfg(test)]
+    fn set_current_genotype(&mut self, i: usize, values: &[u8]) {
+        let start = i * self.num_loci;
+        self.current[start..start + self.num_loci].copy_from_slice(values);
+    }
+
+    fn swap(&mut self) {
+        std::mem::swap(&mut self.current, &mut self.next);
     }
 }
 
-/// A single quantitative trait under Gaussian stabilizing selection.
-///
-#[derive(Clone, Debug)]
-pub struct GaussianSelectionTrait {
-    /// Accumulated effect of all fixed mutations.
-    pub baseline: f64,
-    /// Strength of selection 1 / (2 * sigma^2)
-    pub selection_coeff: f64,
+/// Double-buffered fitness storage
+struct FitnessBuffer {
+    current: Vec<f64>,
+    next: Vec<f64>,
 }
 
-impl GaussianSelectionTrait {
-    pub fn new(selection_coeff: f64) -> Self {
+impl FitnessBuffer {
+    fn new(capacity: usize) -> Self {
         Self {
-            baseline: 0.0,
-            selection_coeff,
+            current: vec![0.0; capacity],
+            next: vec![0.0; capacity],
         }
     }
 
-    pub fn fitness_contribution(&self, phenotype: f64, optimum: f64) -> f64 {
-        (-self.selection_coeff * (phenotype - optimum).powi(2)).exp()
+    fn current(&self) -> &[f64] {
+        &self.current
+    }
+
+    fn next_mut(&mut self) -> &mut [f64] {
+        &mut self.next
+    }
+
+    fn swap(&mut self) {
+        std::mem::swap(&mut self.current, &mut self.next);
+    }
+}
+
+/// Double-buffered node ID storage
+struct NodeBuffer {
+    current: Vec<tskit::NodeId>,
+    next: Vec<tskit::NodeId>,
+}
+
+impl NodeBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            current: vec![tskit::NodeId::NULL; capacity],
+            next: vec![tskit::NodeId::NULL; capacity],
+        }
+    }
+
+    fn current(&self) -> &[tskit::NodeId] {
+        &self.current
+    }
+
+    fn next_mut(&mut self) -> &mut [tskit::NodeId] {
+        &mut self.next
+    }
+
+    fn swap(&mut self) {
+        std::mem::swap(&mut self.current, &mut self.next);
     }
 }
 
@@ -162,35 +225,20 @@ impl GaussianSelectionTrait {
 #[serializer("serde_json")]
 pub struct PopulationMetadata {
     pub deme_id: usize,
-    /// Per-generation mean phenotypes (offspring pool) for each trait
-    pub mean_phenotypes_offspring: Vec<Vec<f64>>,
-    /// Per-generation mean fitness of offspring pool
-    pub mean_fitness_offspring: Vec<f64>,
-    /// Per-generation mean phenotypes (survivors) for each trait
-    pub mean_phenotypes_survivors: Vec<Vec<f64>>,
-    /// Per-generation number of segregating mutations
-    pub num_segregating_muts: Vec<usize>,
-    /// Per-generation flat row-major covariance of offspring pool: `[generation][T²]`
-    pub cov_phenotypes_offspring: Vec<Vec<f64>>,
-    /// Per-generation flat row-major covariance of survivors: `[generation][T²]`
-    pub cov_phenotypes_survivors: Vec<Vec<f64>>,
+    /// Per-generation allele frequencies: allele_freqs[gen][locus_idx]
+    pub allele_freqs: Vec<Vec<f64>>,
+    /// Per-generation mean fitness
+    pub mean_fitness: Vec<f64>,
 }
 
 // ── Tracker trait ─────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone)]
 pub struct DemeRecord {
-    /// Mean phenotype per trait across the pre-selection offspring pool.
-    pub mean_phenotypes_offspring: Vec<f64>,
-    /// Mean fitness across the pre-selection offspring pool.
-    pub mean_fitness_offspring: f64,
-    /// Mean phenotype per trait after density regulation (before migration).
-    pub mean_phenotypes_survivors: Vec<f64>,
-    /// Number of segregating mutations in this deme.
-    pub num_segregating_muts: usize,
-    /// Flat row-major covariance matrix of the offspring pool (T² elements).
-    pub cov_phenotypes_offspring: Vec<f64>,
-    /// Flat row-major covariance matrix of the K survivors (T² elements).
-    pub cov_phenotypes_survivors: Vec<f64>,
+    /// Allele frequencies per locus (derived allele frequency)
+    pub allele_freqs: Vec<f64>,
+    /// Mean fitness in this generation
+    pub mean_fitness: f64,
 }
 
 pub struct GenerationRecord {
@@ -247,81 +295,26 @@ impl TrackerTrait for SimpleTracker {
     }
 }
 
-// ── Offspring candidate ───────────────────────────────────────────────────────
-
-#[derive(Clone)]
-pub struct OffspringCandidate {
-    /// Which deme this offspring was born into.
-    pub birth_deme: usize,
-    /// Local index into `deme_parents[birth_deme]` / `deme_muts[birth_deme]`.
-    pub pa: usize,
-    pub pb: usize,
-    pub breakpoints: Vec<f64>,
-    pub inherited_muts: IndMuts,
-    /// New mutations NOT yet in the registry: `(position, per-trait effects)`.
-    pub new_mut_data: Vec<(f64, Vec<f64>)>,
-}
-
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-pub fn rotate_edges(bookmark: &tskit::types::Bookmark, tables: &mut tskit::TableCollection) {
+// From https://github.com/tskit-dev/tskit-rust/blob/4200bd97890d309c4e24098321fdb9062fa130b5/examples/haploid_wright_fisher.rs#L33
+fn rotate_edges(bookmark: &tskit::types::Bookmark, tables: &mut tskit::TableCollection) {
     let num_edges = tables.edges().num_rows().as_usize();
+    let left =
+        unsafe { std::slice::from_raw_parts_mut((*tables.as_mut_ptr()).edges.left, num_edges) };
+    let right =
+        unsafe { std::slice::from_raw_parts_mut((*tables.as_mut_ptr()).edges.right, num_edges) };
+    let parent =
+        unsafe { std::slice::from_raw_parts_mut((*tables.as_mut_ptr()).edges.parent, num_edges) };
+    let child =
+        unsafe { std::slice::from_raw_parts_mut((*tables.as_mut_ptr()).edges.child, num_edges) };
     let mid = bookmark.edges().as_usize();
-    if mid == 0 || mid == num_edges {
-        return;
-    }
-    unsafe {
-        let p = (*tables.as_mut_ptr()).edges;
-        std::slice::from_raw_parts_mut(p.left, num_edges).rotate_left(mid);
-        std::slice::from_raw_parts_mut(p.right, num_edges).rotate_left(mid);
-        std::slice::from_raw_parts_mut(p.parent, num_edges).rotate_left(mid);
-        std::slice::from_raw_parts_mut(p.child, num_edges).rotate_left(mid);
-    }
-}
-
-/// MLE estimates for a multivariate normal from a slice of data points.
-/// Returns `(mean, cov_flat)` where `cov_flat` is the T×T covariance
-/// stored row-major (population covariance, divide by n).
-/// Returns empty vecs if data is empty or T == 0.
-fn mle_mvn(data: &[Vec<f64>]) -> (Vec<f64>, Vec<f64>) {
-    let n = data.len();
-    if n == 0 {
-        return (vec![], vec![]);
-    }
-    let t = data[0].len();
-    if t == 0 {
-        return (vec![], vec![]);
-    }
-
-    // Mean
-    let mut mean = vec![0.0_f64; t];
-    for x in data {
-        for (i, &v) in x.iter().enumerate() {
-            mean[i] += v;
-        }
-    }
-    for m in &mut mean {
-        *m /= n as f64;
-    }
-
-    // Covariance (population, 1/n)
-    let mut cov = vec![0.0_f64; t * t];
-    for x in data {
-        for i in 0..t {
-            for j in 0..t {
-                cov[i * t + j] += (x[i] - mean[i]) * (x[j] - mean[j]);
-            }
-        }
-    }
-    for c in &mut cov {
-        *c /= n as f64;
-    }
-
-    (mean, cov)
+    left.rotate_left(mid);
+    right.rotate_left(mid);
+    parent.rotate_left(mid);
+    child.rotate_left(mid);
 }
 
 // ── Simulator ─────────────────────────────────────────────────────────────────
-//#[derive(Clone)]
 pub struct WrightFisher {
     pub params: Parameters,
     pub tables: tskit::TableCollection,
@@ -329,21 +322,26 @@ pub struct WrightFisher {
     pub birth_time: i64,
     pub bookmark: tskit::types::Bookmark,
 
-    pub registry: MutationRegistry,
-    /// Shared selection trait definitions (no optimum; optima live in DemeConfig).
-    pub traits: Vec<GaussianSelectionTrait>,
+    // Genetic architecture
+    pub architecture: GeneticArchitecture,
+
     pub deme_configs: Vec<DemeConfig>,
-    /// `deme_parents[d][i]` = NodeId of individual i in deme d.
-    pub deme_parents: Vec<Vec<tskit::NodeId>>,
-    /// `deme_muts[d][i]` = segregating mutations of individual i in deme d.
-    pub deme_muts: Vec<Vec<IndMuts>>,
 
-    /// Optional assortative mating rule applied during offspring pool generation.
-    pub assortative_mating: Option<AssortativeMating>,
+    // Double-buffered storage (one buffer per deme)
+    genotype_buffers: Vec<GenotypeBuffer>,
+    fitness_buffers: Vec<FitnessBuffer>,
+    node_buffers: Vec<NodeBuffer>,
 
-    // Cached Poisson distributions (λ = rate × seq_len).
+    // Reusable working memory
+    breakpoints_buffer: Vec<f64>,  // Reused for recombination
+    deme_records: Vec<DemeRecord>, // Updated in-place each generation
+    parent_scratch: Vec<u8>,       // 2 * num_loci (pa then pb)
+    offspring_scratch: Vec<u8>,    // num_loci
+
+    // Cached Poisson distributions
+    migration_poisson: Vec<Option<Poisson<f64>>>,
     rec_poisson: Option<Poisson<f64>>,
-    mut_poisson: Option<Poisson<f64>>,
+    mut_poisson: Option<Poisson<f64>>, // Poisson(mutation_rate × num_loci)
 }
 
 impl WrightFisher {
@@ -351,250 +349,279 @@ impl WrightFisher {
 
     pub fn initialize(
         params: Parameters,
-        traits: Vec<GaussianSelectionTrait>,
+        architecture: GeneticArchitecture,
         mut deme_configs: Vec<DemeConfig>,
     ) -> Result<Self> {
-        let mut tables = tskit::TableCollection::new(params.sequence_length)?;
+        // Validate deme count matches architecture
+        if deme_configs.len() != architecture.num_demes {
+            return Err(anyhow!(
+                "Architecture expects {} demes, got {}",
+                architecture.num_demes,
+                deme_configs.len()
+            ));
+        }
 
-        // Register one tskit population per deme.
+        let rng = SmallRng::seed_from_u64(params.random_seed);
+        let mut tables = tskit::TableCollection::new(params.sequence_length)?;
+        let birth_time = params.runtime as i64 - 1;
+
+        // Initialize populations
         for dc in deme_configs.iter_mut() {
             dc.population_id = tables.add_population()?;
         }
 
-        let parental_time = params.runtime as f64;
-        let num_traits = traits.len();
-
-        let mut deme_parents: Vec<Vec<tskit::NodeId>> = Vec::with_capacity(deme_configs.len());
-        let mut deme_muts: Vec<Vec<IndMuts>> = Vec::with_capacity(deme_configs.len());
+        // Initialize generation 0 with double buffers
+        let num_loci = architecture.num_loci();
+        let mut genotype_buffers = Vec::new();
+        let mut fitness_buffers = Vec::new();
+        let mut node_buffers = Vec::new();
 
         for dc in &deme_configs {
             let k = dc.carrying_capacity;
-            let pop_id = dc.population_id;
-            let parents = (0..k)
-                .map(|_| tables.add_node(0, parental_time, pop_id, -1))
-                .collect::<Result<Vec<_>, _>>()?;
-            deme_parents.push(parents);
-            deme_muts.push(vec![IndMuts::new(); k]);
+
+            // Create buffers
+            genotype_buffers.push(GenotypeBuffer::new(k, num_loci));
+            let mut fitness_buffer = FitnessBuffer::new(k);
+
+            // Initialize nodes for generation 0
+            let mut node_buffer = NodeBuffer::new(k);
+            for i in 0..k {
+                let node = tables.add_node(0, params.runtime as f64, dc.population_id, -1)?;
+                node_buffer.current[i] = node;
+                // Initialize fitness to 1.0 (neutral) for generation 0
+                fitness_buffer.current[i] = 1.0;
+            }
+            node_buffers.push(node_buffer);
+            fitness_buffers.push(fitness_buffer);
         }
 
-        let rng = SmallRng::seed_from_u64(params.random_seed);
-        let birth_time = params.runtime as i64 - 1;
+        // Pre-allocate working memory
+        let expected_breakpoints =
+            (params.recombination_rate * params.sequence_length).ceil() as usize;
+        let breakpoints_buffer = Vec::with_capacity((expected_breakpoints * 10).max(10));
+        let deme_records = vec![
+            DemeRecord {
+                allele_freqs: vec![0.0; num_loci],
+                mean_fitness: 0.0,
+            };
+            deme_configs.len()
+        ];
 
-        let rec_poisson = if params.recombination_rate * params.sequence_length > 0.0 {
+        // Cache Poisson distributions
+        let rec_poisson = if params.recombination_rate > 0.0 {
             Some(Poisson::new(
                 params.recombination_rate * params.sequence_length,
             )?)
         } else {
             None
         };
-        let mut_poisson =
-            if !traits.is_empty() && params.mutation_rate * params.sequence_length > 0.0 {
-                Some(Poisson::new(params.mutation_rate * params.sequence_length)?)
-            } else {
-                None
-            };
+
+        let mut_poisson = if params.mutation_rate > 0.0 && num_loci > 0 {
+            Some(Poisson::new(params.mutation_rate * num_loci as f64)?)
+        } else {
+            None
+        };
+
+        let total_migration_rates = deme_configs
+            .iter()
+            .map(|d| d.carrying_capacity as f64 * d.migration_rate)
+            .collect::<Vec<f64>>();
+        let migration_poisson = total_migration_rates
+            .iter()
+            .map(|&rate| {
+                if rate > 0.0 {
+                    Some(Poisson::new(rate).expect("Invalid migration rate"))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let parent_scratch = vec![0u8; 2 * num_loci];
+        let offspring_scratch = vec![0u8; num_loci];
 
         Ok(Self {
-            registry: MutationRegistry::new(num_traits),
-            traits,
-            deme_configs,
-            deme_parents,
-            deme_muts,
             params,
             tables,
             rng,
             birth_time,
             bookmark: tskit::types::Bookmark::default(),
-            assortative_mating: None,
+            architecture,
+            deme_configs,
+            genotype_buffers,
+            fitness_buffers,
+            node_buffers,
+            breakpoints_buffer,
+            deme_records,
+            parent_scratch,
+            offspring_scratch,
             rec_poisson,
             mut_poisson,
+            migration_poisson,
         })
-    }
-
-    // ── Phenotype ─────────────────────────────────────────────────────────────
-
-    pub fn candidate_phenotype(&self, c: &OffspringCandidate, t: usize) -> f64 {
-        let baseline = self.traits[t].baseline;
-        let inherited: f64 = c
-            .inherited_muts
-            .iter()
-            .map(|&(_, idx)| self.registry.effects[idx][t])
-            .sum();
-        let new_muts: f64 = c.new_mut_data.iter().map(|(_, eff)| eff[t]).sum();
-        baseline + inherited + new_muts
-    }
-
-    /// Phenotype of the current (parental) individual `i` in deme `d` for trait `t`.
-    pub fn parent_phenotype(&self, d: usize, i: usize, t: usize) -> f64 {
-        let baseline = self.traits[t].baseline;
-        let inherited: f64 = self.deme_muts[d][i]
-            .iter()
-            .map(|&(_, idx)| self.registry.effects[idx][t])
-            .sum();
-        baseline + inherited
     }
 
     // ── Fitness ───────────────────────────────────────────────────────────────
 
-    pub fn candidate_fitness_in_deme(&self, c: &OffspringCandidate, d: usize) -> f64 {
-        (0..self.traits.len())
-            .map(|t| {
-                let z = self.candidate_phenotype(c, t);
-                let opt = self.deme_configs[d].trait_optima[t];
-                self.traits[t].fitness_contribution(z, opt)
-            })
-            .product()
-    }
+    /// Compute additive fitness for an individual in a deme
+    /// Fitness = exo(\sum s_i) for all loci with derived allele (1)
+    pub fn parental_fitness(&self, d: usize, i: usize) -> f64 {
+        let genotype = self.genotype_buffers[d].current_genotype(i);
+        let num_loci = genotype.len();
+        let mut phenotype = 0.0;
 
-    // ── Fixed-mutation removal ────────────────────────────────────────────────
-
-    pub fn remove_fixed_mutations(&mut self) {
-        if self.traits.is_empty() {
-            return;
-        }
-        let total_n: usize = self
-            .deme_configs
-            .iter()
-            .map(|dc| dc.carrying_capacity)
-            .sum();
-        if total_n == 0 {
-            return;
-        }
-
-        let mut counts: HashMap<usize, usize> = HashMap::new();
-        for deme in &self.deme_muts {
-            for ind in deme {
-                for &(_, idx) in ind {
-                    *counts.entry(idx).or_insert(0) += 1;
+        // SAFETY: l is in 0..num_loci, genotype slice has exactly num_loci elements
+        unsafe {
+            for l in 0..num_loci {
+                if *genotype.get_unchecked(l) == 1 {
+                    phenotype += self.architecture.selection_coeff(l, d);
                 }
             }
         }
 
-        let fixed: HashSet<usize> = counts
-            .into_iter()
-            .filter(|&(_, count)| count == total_n)
-            .map(|(idx, _)| idx)
-            .collect();
-
-        if fixed.is_empty() {
-            return;
-        }
-
-        for &idx in &fixed {
-            for (t, tr) in self.traits.iter_mut().enumerate() {
-                tr.baseline += self.registry.effects[idx][t];
-            }
-        }
-
-        for deme in &mut self.deme_muts {
-            for ind in deme.iter_mut() {
-                ind.retain(|&(_, idx)| !fixed.contains(&idx));
-            }
-        }
+        phenotype.exp()
     }
 
     // ── Core reproductive step ────────────────────────────────────────────────
 
-    pub fn sample_candidate(
+    /// Create offspring directly in pre-allocated buffers
+    fn create_offspring_in_place(
         &mut self,
-        d: usize,
-        pa: usize,
-        pb: usize,
-    ) -> Result<OffspringCandidate> {
+        source_deme: usize,
+        pa_idx: usize,
+        pb_idx: usize,
+        birth_time: f64,
+        dest_deme: usize,
+        offspring_idx: usize,
+    ) -> Result<()> {
+        let num_loci = self.architecture.num_loci();
         let seq_len = self.params.sequence_length;
 
-        // ── Recombination breakpoints ─────────────────────────────────────────
-        let num_bp = match &self.rec_poisson {
-            Some(dist) => dist.sample(&mut self.rng) as usize,
-            None => 0,
-        };
-        let breakpoints = if num_bp > 0 && seq_len >= 2.0 {
-            let bp_dist = Uniform::new(1u64, seq_len as u64)?;
-            let mut bps_u64: Vec<u64> =
-                (0..num_bp).map(|_| bp_dist.sample(&mut self.rng)).collect();
-            bps_u64.sort_unstable();
-            bps_u64.dedup();
-            bps_u64.iter().map(|&x| x as f64).collect()
-        } else {
-            vec![]
-        };
+        // Get parent node IDs (Copy types, borrow released immediately)
+        let pa_node = self.node_buffers[source_deme].current()[pa_idx];
+        let pb_node = self.node_buffers[source_deme].current()[pb_idx];
 
-        // ── Mutation inheritance ──────────────────────────────────────────────
-        let mut inherited_muts: IndMuts = Vec::new();
-        let mut cur_idx = pa;
-        let mut other_idx = pb;
-        let mut start = 0.0f64;
-
-        for &x in &breakpoints {
-            let muts = &self.deme_muts[d][cur_idx];
-            let lo = muts.partition_point(|&(pos, _)| pos < start);
-            let hi = muts.partition_point(|&(pos, _)| pos < x);
-            inherited_muts.extend_from_slice(&muts[lo..hi]);
-            std::mem::swap(&mut cur_idx, &mut other_idx);
-            start = x;
+        // Copy-in: copy parent genotypes into scratch buffers
+        let pa_off = pa_idx * num_loci;
+        let pb_off = pb_idx * num_loci;
+        debug_assert!(pa_off + num_loci <= self.genotype_buffers[source_deme].current.len());
+        debug_assert!(pb_off + num_loci <= self.genotype_buffers[source_deme].current.len());
+        debug_assert!(2 * num_loci <= self.parent_scratch.len());
+        // SAFETY: offsets validated by debug_assert; buffers allocated to K * num_loci
+        // in initialize(), and pa_idx/pb_idx < K.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.genotype_buffers[source_deme]
+                    .current
+                    .as_ptr()
+                    .add(pa_off),
+                self.parent_scratch.as_mut_ptr(),
+                num_loci,
+            );
+            std::ptr::copy_nonoverlapping(
+                self.genotype_buffers[source_deme]
+                    .current
+                    .as_ptr()
+                    .add(pb_off),
+                self.parent_scratch.as_mut_ptr().add(num_loci),
+                num_loci,
+            );
         }
-        let muts = &self.deme_muts[d][cur_idx];
-        let lo = muts.partition_point(|&(pos, _)| pos < start);
-        inherited_muts.extend_from_slice(&muts[lo..]);
 
-        // ── New mutations ─────────────────────────────────────────────────────
-        let mut new_mut_data: Vec<(f64, Vec<f64>)> = Vec::new();
-        if let Some(dist) = &self.mut_poisson {
-            let num_new = dist.sample(&mut self.rng) as usize;
-            let pos_dist = Uniform::new(0.0f64, seq_len)?;
-            let num_traits = self.registry.num_traits;
-            for _ in 0..num_new {
-                let pos = pos_dist.sample(&mut self.rng);
-                let effects = self.params.effect_dist.sample(&mut self.rng, num_traits);
-                new_mut_data.push((pos, effects));
+        // Sample recombination breakpoints (reuse buffer)
+        self.breakpoints_buffer.clear();
+        if let Some(dist) = &self.rec_poisson {
+            let num_bp = dist.sample(&mut self.rng) as usize;
+            for _ in 0..num_bp {
+                self.breakpoints_buffer
+                    .push(self.rng.random_range(0.0..seq_len));
+            }
+            self.breakpoints_buffer
+                .sort_by(|a, b| a.partial_cmp(b).unwrap());
+        }
+
+        // Single-pass merge recombination into offspring_scratch
+        // Both positions and breakpoints are sorted, so we advance through both in one pass.
+        // SAFETY: all indices l are in 0..num_loci; parent_scratch has 2*num_loci elements;
+        // offspring_scratch, positions have num_loci elements; bp_i < num_bp checked in while.
+        let positions = self.architecture.positions();
+        let num_bp = self.breakpoints_buffer.len();
+        let mut bp_i = 0;
+        let mut current_parent = 0usize; // 0 = pa (offset 0), 1 = pb (offset num_loci)
+
+        unsafe {
+            for l in 0..num_loci {
+                let pos = *positions.get_unchecked(l);
+                while bp_i < num_bp && *self.breakpoints_buffer.get_unchecked(bp_i) <= pos {
+                    current_parent = 1 - current_parent;
+                    bp_i += 1;
+                }
+                let parent_off = current_parent * num_loci;
+                *self.offspring_scratch.get_unchecked_mut(l) =
+                    *self.parent_scratch.get_unchecked(parent_off + l);
             }
         }
 
-        Ok(OffspringCandidate {
-            birth_deme: d,
-            pa,
-            pb,
-            breakpoints,
-            inherited_muts,
-            new_mut_data,
-        })
-    }
-
-    pub fn commit_to_tables(
-        &mut self,
-        birth_time: f64,
-        candidate: OffspringCandidate,
-    ) -> Result<(tskit::NodeId, IndMuts)> {
-        let seq_len = self.params.sequence_length;
-        let d = candidate.birth_deme;
-        let parent_a = self.deme_parents[d][candidate.pa];
-        let parent_b = self.deme_parents[d][candidate.pb];
-        let pop_id = self.deme_configs[d].population_id;
-
-        // Register new mutations now that this offspring has survived.
-        let mut child_muts = candidate.inherited_muts;
-        for (pos, effects) in candidate.new_mut_data {
-            let idx = self.registry.push(pos, effects);
-            let at = child_muts.partition_point(|&(p, _)| p < pos);
-            child_muts.insert(at, (pos, idx));
+        // Apply mutations (in-place in offspring scratch)
+        if let Some(dist) = &self.mut_poisson {
+            let num_muts = dist.sample(&mut self.rng) as usize;
+            for _ in 0..num_muts {
+                let l = self.rng.random_range(0..num_loci);
+                // SAFETY: l is sampled from 0..num_loci, offspring_scratch has num_loci elements
+                unsafe {
+                    *self.offspring_scratch.get_unchecked_mut(l) ^= 1;
+                }
+            }
         }
 
-        // Add child node tagged with birth deme.
-        let child = self.tables.add_node(0, birth_time, pop_id, -1)?;
+        // Compute fitness from offspring scratch (in destination deme context)
+        // SAFETY: l in 0..num_loci, offspring_scratch has num_loci elements
+        let mut phenotype = 0.0;
+        unsafe {
+            for l in 0..num_loci {
+                if *self.offspring_scratch.get_unchecked(l) == 1 {
+                    phenotype += self.architecture.selection_coeff(l, dest_deme);
+                }
+            }
+        }
+        let fitness = phenotype.exp();
 
-        // Replay edges.
-        let mut cur_node = parent_a;
-        let mut other_node = parent_b;
-        let mut start = 0.0f64;
+        // Copy-out: write offspring genotype back to next buffer
+        let out_off = offspring_idx * num_loci;
+        debug_assert!(out_off + num_loci <= self.genotype_buffers[dest_deme].next.len());
+        // SAFETY: offspring_idx < K, next buffer has K * num_loci elements
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.offspring_scratch.as_ptr(),
+                self.genotype_buffers[dest_deme]
+                    .next
+                    .as_mut_ptr()
+                    .add(out_off),
+                num_loci,
+            );
+        }
 
-        for &x in &candidate.breakpoints {
-            self.tables.add_edge(start, x, cur_node, child)?;
+        // Add child node to tskit
+        let dest_pop_id = self.deme_configs[dest_deme].population_id;
+        let child_node = self.tables.add_node(0, birth_time, dest_pop_id, -1)?;
+
+        // Add edges
+        let mut cur_node = pa_node;
+        let mut other_node = pb_node;
+        let mut start = 0.0;
+
+        for &bp in &self.breakpoints_buffer {
+            self.tables.add_edge(start, bp, cur_node, child_node)?;
             std::mem::swap(&mut cur_node, &mut other_node);
-            start = x;
+            start = bp;
         }
-        self.tables.add_edge(start, seq_len, cur_node, child)?;
+        self.tables.add_edge(start, seq_len, cur_node, child_node)?;
 
-        Ok((child, child_muts))
+        // Write fitness and node to output buffers
+        self.node_buffers[dest_deme].next_mut()[offspring_idx] = child_node;
+        self.fitness_buffers[dest_deme].next_mut()[offspring_idx] = fitness;
+
+        Ok(())
     }
 
     // ── Generation loop ───────────────────────────────────────────────────────
@@ -602,233 +629,148 @@ impl WrightFisher {
     pub fn step(&mut self, generation: usize, tracker: &mut dyn TrackerTrait) -> Result<()> {
         let birth_time = self.birth_time as f64;
         let num_demes = self.deme_configs.len();
-        let num_traits = self.traits.len();
 
-        // ── Phase 1: per-deme reproduction + density regulation ───────────────
-        // deme_survivors[d] = Vec of survivors (post-selection, pre-migration)
-        let mut deme_survivors: Vec<Vec<OffspringCandidate>> = Vec::with_capacity(num_demes);
-        let mut gen_deme_records: Vec<DemeRecord> = Vec::with_capacity(num_demes);
-
+        // ── Phase 1: Record statistics from current generation ───────────────
         for d in 0..num_demes {
             let k = self.deme_configs[d].carrying_capacity;
-            let pool_size = ((self.params.fecundity * k as f64) as usize).max(k);
-            let uniform_parent = Uniform::new(0usize, k)?;
+            let fitnesses = self.fitness_buffers[d].current();
+            let num_loci = self.architecture.num_loci();
 
-            // Precompute parental phenotypes for assortative mating (if active).
-            // Store (phenotypes_vec, sigma) so the closure below owns all it needs
-            // without re-borrowing `self`.
-            let am_data: Option<(Vec<f64>, f64)> =
-                self.assortative_mating.as_ref().map(|am| {
-                    let zs = (0..k)
-                        .map(|i| self.parent_phenotype(d, i, am.trait_index))
-                        .collect();
-                    (zs, am.sigma)
-                });
+            // Mean fitness
+            let mean_fitness = fitnesses.iter().sum::<f64>() / k as f64;
 
-            // Produce offspring pool.
-            let candidates: Vec<OffspringCandidate> = (0..pool_size)
-                .map(|_| {
-                    let pa = uniform_parent.sample(&mut self.rng);
-                    let pb = if let Some((ref zs, sigma)) = am_data {
-                        let z_pa = zs[pa];
-                        let weights: Vec<f64> = zs
-                            .iter()
-                            .map(|&z| (-(z_pa - z).powi(2) / (2.0 * sigma * sigma)).exp())
-                            .collect();
-                        WeightedIndex::new(&weights)?.sample(&mut self.rng)
-                    } else {
-                        uniform_parent.sample(&mut self.rng)
-                    };
-                    self.sample_candidate(d, pa, pb)
-                })
-                .collect::<Result<_>>()?;
-
-            // Compute fitnesses.
-            let fitnesses: Vec<f64> = if num_traits == 0 {
-                vec![1.0f64; pool_size]
-            } else {
-                candidates
-                    .iter()
-                    .map(|c| self.candidate_fitness_in_deme(c, d))
-                    .collect()
-            };
-
-            // Record pool statistics.
-            let mean_fitness_offspring = fitnesses.iter().sum::<f64>() / pool_size as f64;
-            let mean_phenotypes_offspring: Vec<f64> = (0..num_traits)
-                .map(|t| {
-                    candidates
-                        .iter()
-                        .map(|c| self.candidate_phenotype(c, t))
-                        .sum::<f64>()
-                        / pool_size as f64
-                })
-                .collect();
-
-            // Collect full-pool phenotype vectors for offspring MVN
-            let offspring_phenos: Vec<Vec<f64>> = (0..pool_size)
-                .map(|i| {
-                    (0..num_traits)
-                        .map(|t| self.candidate_phenotype(&candidates[i], t))
-                        .collect()
-                })
-                .collect();
-            let (_, cov_phenotypes_offspring) = mle_mvn(&offspring_phenos);
-
-            // Density regulation: draw K survivors ∝ fitness.
-            let survivor_indices: Vec<usize> = if num_traits == 0 {
-                let ud = Uniform::new(0usize, pool_size)?;
-                (0..k).map(|_| ud.sample(&mut self.rng)).collect()
-            } else {
-                let dist = WeightedIndex::new(&fitnesses)?;
-                (0..k).map(|_| dist.sample(&mut self.rng)).collect()
-            };
-
-            let mean_phenotypes_survivors: Vec<f64> = (0..num_traits)
-                .map(|t| {
-                    survivor_indices
-                        .iter()
-                        .map(|&i| self.candidate_phenotype(&candidates[i], t))
-                        .sum::<f64>()
-                        / k as f64
-                })
-                .collect();
-
-            // Survivor phenotypes (all K survivors)
-            let survivor_phenos: Vec<Vec<f64>> = survivor_indices
-                .iter()
-                .map(|&i| {
-                    (0..num_traits)
-                        .map(|t| self.candidate_phenotype(&candidates[i], t))
-                        .collect()
-                })
-                .collect();
-            let (_, cov_phenotypes_survivors) = mle_mvn(&survivor_phenos);
-
-            // Count segregating mutations in this deme
-            let mut counts: HashMap<usize, usize> = HashMap::new();
-            for ind in &self.deme_muts[d] {
-                for &(_, idx) in ind {
-                    *counts.entry(idx).or_insert(0) += 1;
+            // Allele frequencies (update in-place, flat buffer access)
+            // SAFETY: i < k, l < num_loci, buffer has k * num_loci elements;
+            // allele_freqs has num_loci elements.
+            let geno_buf = &self.genotype_buffers[d].current;
+            debug_assert!(k * num_loci <= geno_buf.len());
+            for l in 0..num_loci {
+                let mut count = 0usize;
+                for i in 0..k {
+                    if *geno_buf.get(i * num_loci + l).expect("invalid position") == 1 {
+                        count += 1;
+                    }
                 }
+                *self.deme_records[d]
+                    .allele_freqs
+                    .get_mut(l)
+                    .expect("invalid position") = count as f64 / k as f64;
             }
-            let total_n = self.deme_configs[d].carrying_capacity;
-            let num_segregating_muts = counts
-                .iter()
-                .filter(|&(_, count)| *count > 0 && *count < total_n)
-                .count();
-
-            gen_deme_records.push(DemeRecord {
-                mean_phenotypes_offspring,
-                mean_fitness_offspring,
-                mean_phenotypes_survivors,
-                num_segregating_muts,
-                cov_phenotypes_offspring,
-                cov_phenotypes_survivors,
-            });
-
-            let survivors: Vec<OffspringCandidate> = survivor_indices
-                .into_iter()
-                .map(|i| candidates[i].clone())
-                .collect();
-            deme_survivors.push(survivors);
+            self.deme_records[d].mean_fitness = mean_fitness;
         }
 
         tracker.record_generation(
             self,
             generation,
             GenerationRecord {
-                demes: gen_deme_records,
+                demes: self.deme_records.clone(), // Clone is cheap, just Vec<f64>
             },
         )?;
 
-        // ── Phase 2: migration ────────────────────────────────────────────────
-        // Build migrant pool: collect n_mig random individuals from each deme.
-        let mut migrant_pool: Vec<OffspringCandidate> = Vec::new();
-        let mut stayers: Vec<Vec<OffspringCandidate>> = Vec::with_capacity(num_demes);
-
-        for d in 0..num_demes {
-            let k = self.deme_configs[d].carrying_capacity;
-            let n_mig = (self.deme_configs[d].migration_rate * k as f64).round() as usize;
-            let mut survivors = std::mem::take(&mut deme_survivors[d]);
-            for _ in 0..n_mig {
-                if survivors.is_empty() {
-                    break;
+        // ── Phase 2: Generate next generation (one deme at a time) ───────────
+        let fitnesses_weights: Vec<WeightedIndex<f64>> = self
+            .fitness_buffers
+            .iter()
+            .map(|buffer| WeightedIndex::new(buffer.current()).expect("Invalid fitness"))
+            .collect();
+        for dest_deme in 0..num_demes {
+            // First, we take inmigrants from all other populations
+            let k = self.deme_configs[dest_deme].carrying_capacity;
+            let mut n_local = k;
+            let mut offspring_idx = 0;
+            // Part A: Add migrants
+            for source_deme in 0..num_demes {
+                if source_deme == dest_deme {
+                    continue;
                 }
-                let idx = Uniform::new(0usize, survivors.len())?.sample(&mut self.rng);
-                migrant_pool.push(survivors.swap_remove(idx));
-            }
-            stayers.push(survivors);
-        }
+                let n_immigrants = match self.migration_poisson.get(source_deme).unwrap_or(&None) {
+                    Some(mig_poisson) => mig_poisson.sample(&mut self.rng) as usize,
+                    None => 0,
+                };
+                //eprintln!("Adding {n_immigrants} migrants from deme {source_deme}");
+                n_local -= n_immigrants;
+                let source_parent_dist = fitnesses_weights.get(source_deme).expect("Invalid index");
+                for _ in 0..n_immigrants {
+                    debug_assert!(n_immigrants > 0);
+                    let pa = source_parent_dist.sample(&mut self.rng);
+                    let pb = source_parent_dist.sample(&mut self.rng);
 
-        // Shuffle the migrant pool, then distribute.
-        migrant_pool.shuffle(&mut self.rng);
-        let mut migrant_iter = migrant_pool.into_iter();
-        let mut immigrants: Vec<Vec<OffspringCandidate>> = Vec::with_capacity(num_demes);
-        for d in 0..num_demes {
-            let k = self.deme_configs[d].carrying_capacity;
-            let n_mig = (self.deme_configs[d].migration_rate * k as f64).round() as usize;
-            immigrants.push(migrant_iter.by_ref().take(n_mig).collect());
-        }
+                    // Create offspring (born into dest_deme)
+                    self.create_offspring_in_place(
+                        source_deme,
+                        pa,
+                        pb,
+                        birth_time,
+                        dest_deme,
+                        offspring_idx,
+                    )?;
 
-        // ── Phase 3: commit all survivors to tables ───────────────────────────
-        let mut new_deme_parents: Vec<Vec<tskit::NodeId>> = Vec::with_capacity(num_demes);
-        let mut new_deme_muts: Vec<Vec<IndMuts>> = Vec::with_capacity(num_demes);
-
-        for d in 0..num_demes {
-            let mut children_d: Vec<tskit::NodeId> = Vec::new();
-            let mut child_muts_d: Vec<IndMuts> = Vec::new();
-
-            for c in stayers[d].drain(..) {
-                let (node, muts) = self.commit_to_tables(birth_time, c)?;
-                children_d.push(node);
-                child_muts_d.push(muts);
-            }
-            for c in immigrants[d].drain(..) {
-                let (node, muts) = self.commit_to_tables(birth_time, c)?;
-                children_d.push(node);
-                child_muts_d.push(muts);
-            }
-
-            new_deme_parents.push(children_d);
-            new_deme_muts.push(child_muts_d);
-        }
-
-        // ── Phase 4: periodic simplification ─────────────────────────────────
-        let si = self.params.simplify_interval;
-        let do_simplify = si > 0 && self.birth_time % si as i64 == 0;
-
-        if do_simplify {
-            let all_children: Vec<tskit::NodeId> =
-                new_deme_parents.iter().flatten().copied().collect();
-
-            self.tables
-                .sort(&self.bookmark, tskit::TableSortOptions::default())?;
-            rotate_edges(&self.bookmark, &mut self.tables);
-
-            if let Some(idmap) = self.tables.simplify(
-                &all_children,
-                tskit::SimplificationOptions::default(),
-                true,
-            )? {
-                for deme_nodes in new_deme_parents.iter_mut() {
-                    for node in deme_nodes.iter_mut() {
-                        *node = idmap[usize::try_from(*node)?];
-                    }
+                    offspring_idx += 1;
                 }
             }
 
-            self.bookmark.set_edges(self.tables.edges().num_rows());
+            // Part B: Add N-M local offspring
+            let local_parent_dist = fitnesses_weights.get(dest_deme).expect("Invalid index");
+            for _ in 0..n_local {
+                let pa = local_parent_dist.sample(&mut self.rng);
+                let pb = local_parent_dist.sample(&mut self.rng);
+
+                self.create_offspring_in_place(
+                    dest_deme,
+                    pa,
+                    pb,
+                    birth_time,
+                    dest_deme,
+                    offspring_idx,
+                )?;
+
+                offspring_idx += 1;
+            }
+
+            assert_eq!(offspring_idx, k, "Should fill exactly K offspring");
         }
 
-        self.deme_parents = new_deme_parents;
-        self.deme_muts = new_deme_muts;
+        // ── Phase 3: Swap all buffers ─────────────────────────────────────────
+        for d in 0..num_demes {
+            self.genotype_buffers[d].swap();
+            self.node_buffers[d].swap();
+            self.fitness_buffers[d].swap();
+        }
 
-        if do_simplify {
-            self.remove_fixed_mutations();
+        // ── Phase 4: Periodic simplification ──────────────────────────────────
+        if generation > 0 && generation.is_multiple_of(self.params.simplify_interval) {
+            self.simplify()?;
         }
 
         self.birth_time -= 1;
+        Ok(())
+    }
+
+    pub fn simplify(&mut self) -> Result<()> {
+        // Collect all current nodes
+        let mut samples: Vec<tskit::NodeId> = Vec::new();
+        for node_buffer in &self.node_buffers {
+            samples.extend_from_slice(node_buffer.current());
+        }
+
+        self.tables
+            .sort(&self.bookmark, tskit::TableSortOptions::default())?;
+        rotate_edges(&self.bookmark, &mut self.tables);
+
+        if let Some(idmap) = self.tables.simplify(
+            &samples,
+            tskit::SimplificationOptions::KEEP_INPUT_ROOTS,
+            true,
+        )? {
+            // Remap node IDs in current buffers
+            for node_buffer in &mut self.node_buffers {
+                for node in &mut node_buffer.current {
+                    *node = idmap[usize::try_from(*node)?];
+                }
+            }
+        }
+
+        self.bookmark.set_edges(self.tables.edges().num_rows());
         Ok(())
     }
 
@@ -845,14 +787,16 @@ impl WrightFisher {
     // ── Finalization ──────────────────────────────────────────────────────────
 
     pub fn finalize(mut self, tracker: &mut dyn TrackerTrait) -> Result<tskit::TreeSequence> {
-        self.remove_fixed_mutations();
         tracker.finalize(&self)?;
-        let all_parents: Vec<tskit::NodeId> = self.deme_parents.iter().flatten().copied().collect();
+        let mut all_nodes: Vec<tskit::NodeId> = Vec::new();
+        for node_buffer in &self.node_buffers {
+            all_nodes.extend_from_slice(node_buffer.current());
+        }
         self.tables
             .sort(&self.bookmark, tskit::TableSortOptions::default())?;
         rotate_edges(&self.bookmark, &mut self.tables);
         self.tables.simplify(
-            &all_parents,
+            &all_nodes,
             tskit::SimplificationOptions::KEEP_INPUT_ROOTS,
             false,
         )?;
@@ -864,18 +808,19 @@ impl WrightFisher {
     }
 
     /// Finalize with metadata from generation records.
-    /// Automatically handles different numbers of traits.
     pub fn finalize_with_metadata(
         mut self,
         records: &[GenerationRecord],
     ) -> Result<tskit::TreeSequence> {
-        self.remove_fixed_mutations();
-        let all_parents: Vec<tskit::NodeId> = self.deme_parents.iter().flatten().copied().collect();
+        let mut all_nodes: Vec<tskit::NodeId> = Vec::new();
+        for node_buffer in &self.node_buffers {
+            all_nodes.extend_from_slice(node_buffer.current());
+        }
         self.tables
             .sort(&self.bookmark, tskit::TableSortOptions::default())?;
         rotate_edges(&self.bookmark, &mut self.tables);
         self.tables.simplify(
-            &all_parents,
+            &all_nodes,
             tskit::SimplificationOptions::KEEP_INPUT_ROOTS,
             false,
         )?;
@@ -886,36 +831,18 @@ impl WrightFisher {
         let num_demes = self.deme_configs.len();
         for d in 0..num_demes {
             // Extract per-deme data from records
-            let mut mean_phenotypes_offspring: Vec<Vec<f64>> = Vec::new();
-            let mut mean_fitness_offspring: Vec<f64> = Vec::new();
-            let mut mean_phenotypes_survivors: Vec<Vec<f64>> = Vec::new();
-            let mut num_segregating_muts: Vec<usize> = Vec::new();
-            let mut cov_phenotypes_offspring: Vec<Vec<f64>> = Vec::new();
-            let mut cov_phenotypes_survivors: Vec<Vec<f64>> = Vec::new();
+            let allele_freqs: Vec<Vec<f64>> = records
+                .iter()
+                .map(|gr| gr.demes[d].allele_freqs.clone())
+                .collect();
 
-            for record in records {
-                if d < record.demes.len() {
-                    mean_phenotypes_offspring
-                        .push(record.demes[d].mean_phenotypes_offspring.clone());
-                    mean_fitness_offspring.push(record.demes[d].mean_fitness_offspring);
-                    mean_phenotypes_survivors
-                        .push(record.demes[d].mean_phenotypes_survivors.clone());
-                    num_segregating_muts.push(record.demes[d].num_segregating_muts);
-                    cov_phenotypes_offspring
-                        .push(record.demes[d].cov_phenotypes_offspring.clone());
-                    cov_phenotypes_survivors
-                        .push(record.demes[d].cov_phenotypes_survivors.clone());
-                }
-            }
+            let mean_fitness: Vec<f64> =
+                records.iter().map(|gr| gr.demes[d].mean_fitness).collect();
 
             let meta = PopulationMetadata {
                 deme_id: d,
-                mean_phenotypes_offspring,
-                mean_fitness_offspring,
-                mean_phenotypes_survivors,
-                num_segregating_muts,
-                cov_phenotypes_offspring,
-                cov_phenotypes_survivors,
+                allele_freqs,
+                mean_fitness,
             };
             let _ = populations.add_row_with_metadata(&meta)?;
         }
@@ -925,5 +852,130 @@ impl WrightFisher {
             .tables
             .tree_sequence(tskit::TreeSequenceFlags::default())?;
         Ok(tree_sequence)
+    }
+    pub fn get_mut_genotypes(&mut self, i_deme: usize) -> ChunksExactMut<'_, u8> {
+        let long_genotypes = &mut self.genotype_buffers[i_deme].current;
+        let chunk_size = self.deme_configs[i_deme].carrying_capacity;
+        assert!(long_genotypes.len().is_multiple_of(chunk_size));
+        long_genotypes.chunks_exact_mut(chunk_size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_genotype_recombination() {
+        // Create simple architecture with 3 loci
+        let loci = vec![
+            Locus {
+                position: 1e6,
+                selection_coeffs: vec![0.0],
+            },
+            Locus {
+                position: 5e6,
+                selection_coeffs: vec![0.0],
+            },
+            Locus {
+                position: 9e6,
+                selection_coeffs: vec![0.0],
+            },
+        ];
+        let arch = GeneticArchitecture::new(loci, 1).unwrap();
+
+        let params = Parameters::default();
+        let deme_configs = vec![DemeConfig {
+            carrying_capacity: 2,
+            migration_rate: 0.0,
+            population_id: tskit::PopulationId::NULL,
+        }];
+
+        let mut sim = WrightFisher::initialize(params, arch, deme_configs).unwrap();
+
+        // Set parent genotypes manually
+        sim.genotype_buffers[0].set_current_genotype(0, &[1, 1, 1]); // parent A: all derived
+        sim.genotype_buffers[0].set_current_genotype(1, &[0, 0, 0]); // parent B: all ancestral
+
+        // Sample offspring (no mutations)
+        sim.mut_poisson = None;
+        sim.create_offspring_in_place(0, 0, 1, 0.0, 0, 0).unwrap();
+
+        let offspring_genotype = sim.genotype_buffers[0].next_genotype(0);
+        assert_eq!(offspring_genotype.len(), 3);
+        // Each locus should be either 0 or 1 (no invalid values)
+        assert!(offspring_genotype.iter().all(|&a| a == 0 || a == 1));
+    }
+
+    #[test]
+    fn test_fitness_calculation() {
+        let loci = vec![
+            Locus {
+                position: 1e6,
+                selection_coeffs: vec![0.0, 0.1],
+            },
+            Locus {
+                position: 5e6,
+                selection_coeffs: vec![-0.1, -0.1],
+            },
+        ];
+        let arch = GeneticArchitecture::new(loci, 2).unwrap();
+
+        let params = Parameters::default();
+        let deme_configs = vec![
+            DemeConfig {
+                carrying_capacity: 1,
+                migration_rate: 0.0,
+                population_id: tskit::PopulationId::NULL,
+            },
+            DemeConfig {
+                carrying_capacity: 1,
+                migration_rate: 0.0,
+                population_id: tskit::PopulationId::NULL,
+            },
+        ];
+
+        let mut sim = WrightFisher::initialize(params, arch, deme_configs).unwrap();
+
+        // Test genotype: [[1, 0], [1, 0]]
+        sim.genotype_buffers[0].set_current_genotype(0, &[1, 0]);
+        sim.genotype_buffers[1].set_current_genotype(0, &[1, 0]);
+        assert!((sim.parental_fitness(0, 0) - 1.0).abs() < 1e-6);
+        assert!((sim.parental_fitness(1, 0).ln() - 0.1).abs() < 1e-6);
+        // Test genotype: [[1, 1], [1, 1]] = both derived
+        sim.genotype_buffers[0].set_current_genotype(0, &[1, 1]);
+        sim.genotype_buffers[1].set_current_genotype(0, &[1, 1]);
+        //
+        assert!((sim.parental_fitness(0, 0).ln() - -0.1).abs() < 1e-6);
+        assert!((sim.parental_fitness(1, 0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_architecture_validation() {
+        // Should fail: mismatched selection coeff counts
+        let loci = vec![
+            Locus {
+                position: 1e6,
+                selection_coeffs: vec![0.1],
+            },
+            Locus {
+                position: 5e6,
+                selection_coeffs: vec![0.1, 0.2],
+            }, // wrong!
+        ];
+        assert!(GeneticArchitecture::new(loci, 1).is_err());
+
+        // Should fail: unsorted positions
+        let loci = vec![
+            Locus {
+                position: 5e6,
+                selection_coeffs: vec![0.1],
+            },
+            Locus {
+                position: 1e6,
+                selection_coeffs: vec![0.1],
+            }, // out of order!
+        ];
+        assert!(GeneticArchitecture::new(loci, 1).is_err());
     }
 }

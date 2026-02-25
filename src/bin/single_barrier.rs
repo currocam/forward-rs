@@ -6,24 +6,24 @@ use rand::Rng;
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(about = "Two-deme finite sites model with divergent selection")]
+#[command(about = "Single barrier model")]
 struct Args {
     /// Random seed (random if omitted)
     #[arg(long)]
     seed: Option<u64>,
-    #[arg(long, default_value_t = 10000)]
+    #[arg(long, default_value_t = 100000)]
     runtime: usize,
     #[arg(long, default_value_t = 500)]
-    carrying_capacity: usize,
-    #[arg(long, default_value_t = 0.01)]
+    mainland_size: usize,
+    #[arg(long, default_value_t = 500)]
+    island_size: usize,
+    #[arg(long, default_value_t = 0.005)]
     migration_rate: f64,
-    #[arg(long, default_value_t = 1e-5)]
+    #[arg(long, default_value_t = 1e-3)]
     mutation_rate: f64,
-    #[arg(long, default_value_t = 10)]
-    num_loci: usize,
     #[arg(long, default_value_t = 0.05)]
     selection_coeff: f64,
-    #[arg(long, default_value = "two_deme_divergent.trees")]
+    #[arg(long, default_value = "single_barrier.trees")]
     output: String,
 }
 
@@ -32,54 +32,55 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    eprintln!("=== Two demes with divergent selection ({} loci) ===", args.num_loci);
-
     let random_seed = args
         .seed
         .unwrap_or_else(|| rand::rng().random_range(1..u64::MAX));
 
     // Create loci with divergent selection
-    let seq_len = 1e7;
-    let spacing = seq_len / (args.num_loci as f64 + 1.0);
-    let loci: Vec<Locus> = (0..args.num_loci)
-        .map(|i| {
-            let pos = spacing * (i as f64 + 1.0);
-            Locus {
-                position: pos,
-                selection_coeffs: vec![
-                    args.selection_coeff,  // deme 0: beneficial
-                    -args.selection_coeff, // deme 1: deleterious
-                ],
-            }
-        })
-        .collect();
-
+    let seq_len = 1e8;
+    let recombination_rate = 1e-8;
+    let barrier = Locus {
+        position: seq_len / 2.0,
+        selection_coeffs: vec![
+            1.0,                   // strongly beneficial
+            -args.selection_coeff, // island deleterious
+        ],
+    };
+    let loci: Vec<Locus> = vec![barrier];
     let architecture = GeneticArchitecture::new(loci, 2)?;
 
     let params = Parameters {
         random_seed,
         runtime: args.runtime,
-        recombination_rate: 1e-8,
+        recombination_rate: recombination_rate,
         mutation_rate: args.mutation_rate,
         sequence_length: seq_len,
         simplify_interval: 100,
     };
 
-    let deme_configs = vec![
-        DemeConfig {
-            carrying_capacity: args.carrying_capacity,
-            migration_rate: args.migration_rate,
-            population_id: tskit::PopulationId::NULL,
-        },
-        DemeConfig {
-            carrying_capacity: args.carrying_capacity,
-            migration_rate: args.migration_rate,
-            population_id: tskit::PopulationId::NULL,
-        },
-    ];
-
+    let mainland = DemeConfig {
+        carrying_capacity: args.mainland_size,
+        migration_rate: args.migration_rate,
+        population_id: tskit::PopulationId::NULL,
+    };
+    let island = DemeConfig {
+        carrying_capacity: args.island_size,
+        // Migration from island to mainland is neglible
+        migration_rate: 0.0,
+        population_id: tskit::PopulationId::NULL,
+    };
+    let deme_configs = vec![mainland, island];
     let mut sim = WrightFisher::initialize(params, architecture, deme_configs)?;
     let mut tracker = SimpleTracker::new();
+    // We initialize mainland with fixed differences
+    for genotypes in sim.get_mut_genotypes(0) {
+        assert_eq!(genotypes.len(), args.mainland_size);
+        genotypes.fill(1);
+    }
+    for genotypes in sim.get_mut_genotypes(1) {
+        assert_eq!(genotypes.len(), args.island_size);
+        genotypes.fill(0);
+    }
     sim.run(&mut tracker)?;
     let ts = sim.finalize_with_metadata(&tracker.records)?;
     ts.dump(&args.output, tskit::TableOutputOptions::default())?;
